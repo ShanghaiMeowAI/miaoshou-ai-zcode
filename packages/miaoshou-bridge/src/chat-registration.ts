@@ -35,8 +35,7 @@ export function registerChatGuard(app: Hono): ChatRegistration | undefined {
   // 导致 quant 条目被自己的安全策略静默丢弃的配置漂移
   const quantServerUrl = trustedQuantUrl();
   const internalSecret =
-    process.env.QUANT_MCP_INTERNAL_SECRET ||
-    process.env.MIAOSHOU_QUANT_INTERNAL_SECRET;
+    process.env.QUANT_MCP_INTERNAL_SECRET || process.env.MIAOSHOU_QUANT_INTERNAL_SECRET;
   // 与 Python 侧 environs 的布尔解析保持同一口径：1/true/yes/on 均视为开启
   const allowNoSecret = isTruthyFlag(process.env.QUANT_MCP_ALLOW_NO_SECRET);
 
@@ -51,9 +50,7 @@ export function registerChatGuard(app: Hono): ChatRegistration | undefined {
   const failRequired = (reason: string, message: string): void => {
     registrationState.reason = reason;
     if (bridgeRequired) {
-      console.error(
-        `[miaoshou-bridge] ${message}（MIAOSHOU_BRIDGE_REQUIRED=1，进程退出）`,
-      );
+      console.error(`[miaoshou-bridge] ${message}（MIAOSHOU_BRIDGE_REQUIRED=1，进程退出）`);
       process.exit(1);
     }
     console.error(`[miaoshou-bridge] ${message}`);
@@ -61,15 +58,11 @@ export function registerChatGuard(app: Hono): ChatRegistration | undefined {
 
   if (process.env.MIAOSHOU_BRIDGE_MODE?.trim() === "off") {
     if (bridgeRequired) {
-      console.error(
-        "[miaoshou-bridge] BRIDGE_MODE=off 与 BRIDGE_REQUIRED=1 冲突，进程退出",
-      );
+      console.error("[miaoshou-bridge] BRIDGE_MODE=off 与 BRIDGE_REQUIRED=1 冲突，进程退出");
       process.exit(1);
     }
     registrationState.reason = "bridge_mode_off";
-    console.warn(
-      "[miaoshou-bridge] MIAOSHOU_BRIDGE_MODE=off，跳过聊天路由注册",
-    );
+    console.warn("[miaoshou-bridge] MIAOSHOU_BRIDGE_MODE=off，跳过聊天路由注册");
     return undefined;
   }
   // 服务令牌是身份可信的前提，缺失时无条件拒绝注册（开发环境也不例外）；
