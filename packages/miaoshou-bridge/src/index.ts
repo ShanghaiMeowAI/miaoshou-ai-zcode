@@ -104,10 +104,10 @@ export function extractMiaoshouIdentity(
   const rawRole = readSingleHeader(headers, HEADER_USER_ROLE) || "user";
   const role = rawRole === "admin" ? "admin" : "user";
 
-  // 原始 JWT 经 X-Miaoshou-JWT 透传（Kong 替换了 Authorization 为共享令牌后，
-  // 原始 JWT 存在这里供 MCP/AST 调用使用）
-  const rawJwt = readSingleHeader(headers, "x-miaoshou-jwt");
-  const authorization = rawJwt ? `Bearer ${rawJwt}` : undefined;
+  // 原始 JWT 在 Authorization 里(Kong 不替换,与旧服务一致);
+  // 直接透传给 MCP/AST 调用
+  const authorization =
+    readSingleHeader(headers, HEADER_AUTHORIZATION) || undefined;
   return { userId, role, authorization };
 }
 

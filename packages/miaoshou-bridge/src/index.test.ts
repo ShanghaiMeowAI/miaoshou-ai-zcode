@@ -52,11 +52,11 @@ describe("extractMiaoshouIdentity", () => {
     expect(identity).toBeUndefined();
   });
 
-  it("X-Miaoshou-JWT 透传的原始 JWT 作为 authorization", () => {
+  it("原始 Authorization JWT 直接作为 authorization 透传", () => {
     const identity = extractMiaoshouIdentity({
       "x-platform-token": "t",
       "x-user-id": "42",
-      "x-miaoshou-jwt": "raw.jwt.token",
+      authorization: "Bearer raw.jwt.token",
     });
     expect(identity?.authorization).toBe("Bearer raw.jwt.token");
   });
@@ -403,7 +403,6 @@ describe("identityHeaderEntries", () => {
     ]);
   });
 });
-
 
 describe("registerMiaoshouChatRoutes 注册守卫", () => {
   const fakeServices = {

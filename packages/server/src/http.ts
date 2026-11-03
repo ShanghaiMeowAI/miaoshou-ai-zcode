@@ -310,6 +310,11 @@ function hasValidLiteToken(c: Context, token: string): boolean {
   ) {
     return true;
   }
+  // 网关代理路径：Kong 不替换 Authorization(原始 JWT 直接透传，由全局 jwt-auth
+  // 验签并注入 X-User-ID)，网关仅注入 X-Platform-Token 证明请求经过信任边界
+  if (c.req.header("x-platform-token") === token) {
+    return true;
+  }
   const url = new URL(c.req.url);
   if (url.searchParams.get("token") === token) {
     c.header(
