@@ -287,6 +287,148 @@ describe("registerMiaoshouChatRoutes 注册守卫", () => {
     });
   });
 
+  it("回放的历史事件按 eventId 去重，不再重复挂起审批或提前收尾", async () => {
+    await withEnv({ ZCODE_SERVER_AUTH_TOKEN: "t", QUANT_MCP_INTERNAL_SECRET: "s" }, async () => {
+      const { pendingPermissions, conversationSessionMap } = await import("./chat-shared.js");
+      pendingPermissions.clear();
+      conversationSessionMap.clear();
+      conversationSessionMap.set("42:conv-replay", {
+        userId: "42",
+        sessionId: "sess_x",
+        lastUsedAt: Date.now(),
+      });
+      const listeners: Array<(event: unknown) => void> = [];
+      let subscribeCount = 0;
+      const replayServices = {
+        get: () => ({
+          onDynamicSessionEvent:
+            () =>
+            (cb: (event: unknown) => void): { dispose: () => void } => {
+              listeners.push(cb);
+              // 模拟 runtime 回放：上一轮的审批请求（eventId 固定，两条流重复）
+              // 与本轮终态（eventId 每轮唯一）
+              const round = ++subscribeCount;
+              queueMicrotask(() => {
+                cb({
+                  type: "session.event",
+                  event: {
+                    type: "permission.requested",
+                    eventId: "evt-perm-1",
+                    payload: {
+                      requestId: "perm_replay_1",
+                      toolName: "backtest_run",
+                      toolCallId: "call_replay_1",
+                      options: [{ optionId: "a1", kind: "allow_once", name: "允许" }],
+                    },
+                  },
+                });
+                cb({
+                  type: "session.event",
+                  event: {
+                    type: "turn.completed",
+                    eventId: `evt-done-${round}`,
+                    payload: { resultType: "success", response: "ok" },
+                  },
+                });
+              });
+              return { dispose: () => {} };
+            },
+          sendConversationCommandV4: async () => ({ status: "accepted" }),
+          closeSession: async () => true,
+          createSession: async () => ({ session: { sessionId: "sess_x" } }),
+          sendPrompt: async () => ({ ok: true }),
+        }),
+        getOptional: () => undefined,
+      } as unknown as Parameters<typeof registerMiaoshouChatRoutes>[1];
+      const app = new Hono();
+      registerMiaoshouChatRoutes(app, replayServices);
+      try {
+        // 第一条流：回放事件被当作新事件处理（登记 eventId、挂起审批）
+        const first = await app.request("/api/agent/chat", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-platform-token": "t",
+            "x-user-id": "42",
+            "x-user-role": "user",
+          },
+          body: JSON.stringify({
+            conversation_id: "conv-replay",
+            message: "跑回测",
+            run_id: "run-replay-1",
+          }),
+        });
+        const firstText = await first.text();
+        expect(firstText).toContain('"type":"interrupt"');
+        expect(pendingPermissions.has("perm_replay_1")).toBe(true);
+        pendingPermissions.clear();
+        // 第二条流：同一审批事件再次到达（回放）→ 去重闸挡住，不再挂起
+        const second = await app.request("/api/agent/chat", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-platform-token": "t",
+            "x-user-id": "42",
+            "x-user-role": "user",
+          },
+          body: JSON.stringify({
+            conversation_id: "conv-replay",
+            message: "继续",
+            run_id: "run-replay-2",
+          }),
+        });
+        const text = await second.text();
+        expect(text).not.toContain('"type":"interrupt"');
+        expect(text).not.toContain('"interrupted":true');
+        expect(text).toContain('"type":"done"');
+      } finally {
+        pendingPermissions.clear();
+        conversationSessionMap.clear();
+      }
+    });
+  });
+
+  it("只投 result 不投 scheduled 时补记带结果的工具卡片", async () => {
+    await withEnv({ ZCODE_SERVER_AUTH_TOKEN: "t", QUANT_MCP_INTERNAL_SECRET: "s" }, async () => {
+      const { conversationSessionMap } = await import("./chat-shared.js");
+      conversationSessionMap.clear();
+      conversationSessionMap.set("42:conv-result", {
+        userId: "42",
+        sessionId: "sess_x",
+        lastUsedAt: Date.now(),
+      });
+      const recorded: Array<Record<string, unknown>> = [];
+      const { handleSessionEvent } = await import("./chat-stream-events.js");
+      handleSessionEvent({
+        event: {
+          type: "tool.updated",
+          payload: {
+            kind: "result",
+            toolCallId: "call_only_result",
+            toolName: "get_strategy_detail",
+            result: { content: [{ text: "策略详情" }] },
+          },
+        },
+        accumulator: {
+          assistantText: "",
+          truncated: false,
+          stickyTruncated: false,
+          queuedDeltaBytes: 0,
+        },
+        runId: "run-r",
+        recordedBlocks: recorded,
+        emittedToolCalls: new Set(),
+        registeredToolNames: new Map(),
+        writeEvent: () => {},
+      });
+      expect(recorded).toHaveLength(1);
+      expect(recorded[0]?.type).toBe("tool_call");
+      expect(recorded[0]?.id).toBe("call_only_result");
+      expect(recorded[0]?.result).toContain("策略详情");
+      conversationSessionMap.clear();
+    });
+  });
+
   it("审批挂起时输入文本 → 隐式取消审批并降级为普通对话", async () => {
     await withEnv({ ZCODE_SERVER_AUTH_TOKEN: "t", QUANT_MCP_INTERNAL_SECRET: "s" }, async () => {
       const { pendingPermissions, conversationSessionMap } = await import("./chat-shared.js");

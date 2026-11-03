@@ -71,6 +71,34 @@ export const runExecutionRegistry = new Map<string, string>();
 export const pendingPermissions = new Map<string, PendingPermission>();
 
 /**
+ * 跨流的会话事件去重登记：聊天流订阅用 web-remote-replayable 语义，
+ * runtime 会把历史事件回放给新订阅；不挡住回放，上一轮已处理的审批会
+ * 再次挂起（审批卡片复活）、已发过的工具卡片与文本会重复下发。
+ * 同一事件的 eventId 在实时与回放中一致，以此为准；容量与 TTL 双淘汰。
+ */
+const seenSessionEventIds = new Map<string, number>();
+const SEEN_EVENT_ID_MAX = 5000;
+const SEEN_EVENT_ID_TTL_MS = 30 * 60_000;
+
+/** 返回 true 表示首次见到（应处理）；false 表示重复事件（直接忽略）。 */
+export function consumeSessionEventId(eventId: unknown): boolean {
+  if (typeof eventId !== "string" || !eventId) return true;
+  const now = Date.now();
+  if (seenSessionEventIds.size >= SEEN_EVENT_ID_MAX) {
+    for (const [key, seenAt] of seenSessionEventIds) {
+      if (now - seenAt > SEEN_EVENT_ID_TTL_MS) seenSessionEventIds.delete(key);
+    }
+  }
+  if (seenSessionEventIds.has(eventId)) return false;
+  seenSessionEventIds.set(eventId, now);
+  if (seenSessionEventIds.size > SEEN_EVENT_ID_MAX) {
+    const oldest = seenSessionEventIds.keys().next().value;
+    if (oldest !== undefined) seenSessionEventIds.delete(oldest);
+  }
+  return true;
+}
+
+/**
  * 按会话串行的消息回写链：审批轮与 resume 轮的落库必须保持先后顺序，
  * 否则前端 markResolvedInterrupts 读到的消息序列错乱，审批卡片会复活成待处理。
  * 链上任何一次写入失败都不阻断后续写入（回写是展示层需求，不能打断对话）。

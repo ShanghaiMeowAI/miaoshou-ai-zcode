@@ -22,6 +22,7 @@ import {
   SESSION_TOOL_DENYLIST,
   STREAM_TIMEOUT_MS,
   buildCommandEnvelope,
+  consumeSessionEventId,
   conversationSessionMap,
   createProjectIdResolver,
   dropDeniedToolResults,
@@ -375,6 +376,9 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
         });
         // 审批挂起处置：登记挂起、记录卡片、下发 interrupt 并终态化本流
         const suspendStream = (permission: PendingPermission, interruptPayload: unknown): void => {
+          // 幂等防御：同一 requestId 已有挂起审批时不重复登记与下发
+          // （顶层 permission.requested 形态无 eventId，不经过回放去重闸）
+          if (pendingPermissions.has(permission.requestId)) return;
           pendingPermissions.set(permission.requestId, permission);
           // 主动过期：用户不回来操作时到点自动拒绝，避免权限请求永久悬挂卡死会话
           const expiryTimer = setTimeout(() => {
@@ -413,6 +417,16 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
         const disposable = subscription(
           (serviceEvent: { type?: string } & Record<string, unknown>) => {
             try {
+              // 回放去重闸（必须在一切处理之前）：resume/重连流的订阅会收到
+              // 历史事件回放，上一轮已处理的审批、工具卡片、文本与终态一律
+              // 不再处理，否则审批卡片复活、工具卡片与文本重复下发
+              if (serviceEvent.type === "session.event") {
+                const probe = serviceEvent.event as
+                  | { eventId?: unknown; type?: unknown }
+                  | undefined;
+                if (!probe || typeof probe.type !== "string") return;
+                if (!consumeSessionEventId(probe.eventId)) return;
+              }
               // 审批事件处理拆在 approval-routes(handlePermissionRequestedEvent):
               // 兼容 permission.request 与核心协议 permission.requested、
               // 顶层与嵌套 session.event 两种载荷形态
@@ -447,7 +461,11 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
 
               if (serviceEvent.type !== "session.event") return;
               const event = serviceEvent.event as
-                | { type: string; payload?: Record<string, unknown> }
+                | {
+                    type: string;
+                    payload?: Record<string, unknown>;
+                    eventId?: unknown;
+                  }
                 | undefined;
               if (!event) return;
 

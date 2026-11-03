@@ -81,17 +81,25 @@ export function handleSessionEvent(params: {
       error?: { message?: string };
     };
     if (toolPayload.kind === "scheduled" || toolPayload.kind === "started") {
-      // 协议对同一 toolCallId 先后投递 scheduled 与 started 两个事件，
-      // 只发一次 tool_call，避免前端出现重复的“执行中”卡片；
-      // 审批前那条流已发过挂起工具的卡片，恢复流不再重复下发
-      if (params.emittedToolCalls.has(toolPayload.toolCallId)) return true;
-      if (params.resumedToolCallId === toolPayload.toolCallId) {
-        params.emittedToolCalls.add(toolPayload.toolCallId);
-        return true;
-      }
       const toolName =
         params.registeredToolNames.get(toolPayload.toolCallId) ??
         normalizeQuantToolName(toolPayload.toolName ?? "");
+      // 协议对同一 toolCallId 先后投递 scheduled 与 started 两个事件，
+      // 只发一次 tool_call，避免前端出现重复的“执行中”卡片；
+      // 审批前那条流已发过挂起工具的卡片，恢复流不再重复下发，
+      // 但卡片仍要记入 blocks——runtime 常常只投 result 不投 scheduled，
+      // 恢复流不记卡片会让审批工具在刷新后消失
+      if (params.emittedToolCalls.has(toolPayload.toolCallId)) return true;
+      if (params.resumedToolCallId === toolPayload.toolCallId) {
+        params.emittedToolCalls.add(toolPayload.toolCallId);
+        params.recordedBlocks.push({
+          type: "tool_call",
+          id: toolPayload.toolCallId,
+          name: eventToolName(toolName),
+          args: toolPayload.input,
+        });
+        return true;
+      }
       params.emittedToolCalls.add(toolPayload.toolCallId);
       params.recordedBlocks.push({
         type: "tool_call",
@@ -115,18 +123,6 @@ export function handleSessionEvent(params: {
       const toolName =
         params.registeredToolNames.get(toolPayload.toolCallId) ??
         normalizeQuantToolName(toolPayload.toolName ?? "");
-      // 部分投递通道只送达终态：为保证前端按 id 配对，补发缺失的 tool_call
-      if (toolPayload.toolCallId && !params.emittedToolCalls.has(toolPayload.toolCallId)) {
-        params.emittedToolCalls.add(toolPayload.toolCallId);
-        params.writeEvent(
-          {
-            type: "tool_call",
-            id: toolPayload.toolCallId,
-            name: eventToolName(toolName),
-          },
-          false,
-        );
-      }
       // 旧前端契约：content 是工具输出的业务文本（不是结果信封），
       // ok 字段供前端判成败（构造与判定拆在 chat-shared）
       const trPayload = buildToolResultPayload({
@@ -136,6 +132,26 @@ export function handleSessionEvent(params: {
         result: toolPayload.result,
         errorMessage: toolPayload.error?.message,
       });
+      // 部分投递通道只送达终态（runtime 对部分工具不投 scheduled）：为保证
+      // 前端按 id 配对，补发缺失的 tool_call；同时补记卡片（带结果），
+      // 否则刷新后这一轮的工具卡片全部消失
+      if (toolPayload.toolCallId && !params.emittedToolCalls.has(toolPayload.toolCallId)) {
+        params.emittedToolCalls.add(toolPayload.toolCallId);
+        params.recordedBlocks.push({
+          type: "tool_call",
+          id: toolPayload.toolCallId,
+          name: eventToolName(toolName),
+          result: trPayload.content,
+        });
+        params.writeEvent(
+          {
+            type: "tool_call",
+            id: toolPayload.toolCallId,
+            name: eventToolName(toolName),
+          },
+          false,
+        );
+      }
       for (let bi = params.recordedBlocks.length - 1; bi >= 0; bi--) {
         const blk = params.recordedBlocks[bi];
         if (blk && blk.type === "tool_call" && blk.id === toolPayload.toolCallId) {
