@@ -46,7 +46,9 @@ export function registerHealthz(
           const healthUrl = deps.quantServerUrl.replace(/\/mcp\/?$/, "/health");
           const response = await fetch(healthUrl, {
             signal: AbortSignal.timeout(3000),
-            headers: deps.internalSecret ? { "X-Internal-Secret": deps.internalSecret } : {},
+            headers: deps.internalSecret
+              ? { "X-Internal-Secret": deps.internalSecret }
+              : {},
           });
           return response.ok;
         } catch {

@@ -1,10 +1,15 @@
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
-import { IZCodeAgentService, IProjectService, type ServiceCollection } from "@zcode/services";
+import {
+  IZCodeAgentService,
+  IProjectService,
+  type ServiceCollection,
+} from "@zcode/services";
 import {
   applyIdentityToMcpServers,
   clearSessionOwner,
   extractMiaoshouIdentity,
+  extractMiaoshouIdentityFromJWT,
   registerSessionOwner,
   sweepSessionOwners,
 } from "./index.js";
@@ -47,13 +52,20 @@ import {
   resolvePermissionWith,
   sweepExpiredPendingWith,
 } from "./approval-routes.js";
-import { appendBridgeMessages, resolveBridgeConversation } from "./bridge-internal-client.js";
+import {
+  appendBridgeMessages,
+  resolveBridgeConversation,
+} from "./bridge-internal-client.js";
 
 /** assistant 全文的累计上限（回写平台消息表时的截断保护） */
 const ASSISTANT_TEXT_MAX = 64 * 1024;
 
-export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollection): void {
-  const workspacePath = process.env.ZCODE_SERVER_WORKSPACE?.trim() || DEFAULT_WORKSPACE_PATH;
+export function registerMiaoshouChatRoutes(
+  app: Hono,
+  services: ServiceCollection,
+): void {
+  const workspacePath =
+    process.env.ZCODE_SERVER_WORKSPACE?.trim() || DEFAULT_WORKSPACE_PATH;
   // 注册守卫（令牌/密钥检查、healthz 探针、quant 模板装配）拆在 chat-registration；
   // 未通过守卫时业务路由不注册，探针仍可观测真实原因
   const registration = registerChatGuard(app);
@@ -103,19 +115,33 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
    * 确保工作区拥有 projectId（ZCode Server 远程客户端创建会话必需）。
    * 结果按 workspacePath 缓存，避免每条消息重复扫描项目库。
    */
-  const ensureProjectId = createProjectIdResolver(projectService, workspacePath);
+  const ensureProjectId = createProjectIdResolver(
+    projectService,
+    workspacePath,
+  );
 
   const resolvePermission = (
     permission: PendingPermission,
     wantAllow: boolean,
   ): Promise<{ ok: boolean; error?: string }> =>
-    resolvePermissionWith({ workspacePath, rawAgentService }, permission, wantAllow);
+    resolvePermissionWith(
+      { workspacePath, rawAgentService },
+      permission,
+      wantAllow,
+    );
 
   // ── 核心流式对话接口：POST /api/agent/chat ─────────────────────────────
   app.post("/api/agent/chat", async (c) => {
-    const identity = extractMiaoshouIdentity(c.req.raw.headers);
+    // 身份提取优先从 Kong 透传的原始 JWT 验签（安全性最高，不可伪造），
+    // 网关直接注入的 X-User-ID 头作为兜底（本地联调或网关不做 JWT 透传时）
+    const identity =
+      extractMiaoshouIdentityFromJWT(c.req.raw.headers) ??
+      extractMiaoshouIdentity(c.req.raw.headers);
     if (!identity) {
-      return c.json({ detail: "未登录或缺少身份凭证（需网关注入的 X-User-ID）" }, 401);
+      return c.json(
+        { detail: "未登录或缺少身份凭证（需网关注入的 X-User-ID）" },
+        401,
+      );
     }
 
     const body = await c.req.json().catch(() => null);
@@ -125,9 +151,13 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
     const message = typeof body.message === "string" ? body.message : "";
     const { conversation_id } = body;
     const resumePayload = body.resume;
-    const isResume = Boolean(resumePayload && typeof resumePayload === "object");
+    const isResume = Boolean(
+      resumePayload && typeof resumePayload === "object",
+    );
     const runId =
-      typeof body.run_id === "string" && body.run_id ? body.run_id : `run_${Date.now()}`;
+      typeof body.run_id === "string" && body.run_id
+        ? body.run_id
+        : `run_${Date.now()}`;
 
     if (!isResume && !message.trim()) {
       return c.json({ detail: "message 不能为空" }, 400);
@@ -186,7 +216,8 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
         releaseStreamSlot();
         return c.json(
           {
-            detail: "审批回执的 value 只接受 allow 或 deny；文本追问请在审批完成后再发送",
+            detail:
+              "审批回执的 value 只接受 allow 或 deny；文本追问请在审批完成后再发送",
           },
           400,
         );
@@ -215,7 +246,10 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
           mode: "build",
           toolDenylist: SESSION_TOOL_DENYLIST,
           mcpServers:
-            applyIdentityToMcpServers([structuredClone(quantServerTemplate)], identity) ?? [],
+            applyIdentityToMcpServers(
+              [structuredClone(quantServerTemplate)],
+              identity,
+            ) ?? [],
         });
         sessionId = snapshot.session.sessionId;
         registerSessionOwner(sessionId, identity.userId);
@@ -242,7 +276,10 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
       }
     } catch (error) {
       releaseStreamSlot();
-      return c.json({ detail: error instanceof Error ? error.message : "会话准备失败" }, 500);
+      return c.json(
+        { detail: error instanceof Error ? error.message : "会话准备失败" },
+        500,
+      );
     }
     const runKey = `${identity.userId}:${runId}`;
     rememberTracked(runRegistry, runKey, tracked, undefined, MAX_RUNS_PER_USER);
@@ -284,7 +321,8 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
                     stream.writeSSE({
                       data: JSON.stringify({
                         type: "message_delta",
-                        content: "\n\n[回答过长，输出已截断；可收窄问题范围后重试]",
+                        content:
+                          "\n\n[回答过长，输出已截断；可收窄问题范围后重试]",
                       }),
                     }),
                   )
@@ -331,7 +369,9 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
           // 数字编号优先（旧前端 Number(id) 非整数直接丢弃，会话路由就断了）；
           // 回写降级时下发临时标识，前端不采纳但对话仍继续
           id: bridgeConversation ? String(bridgeConversation.id) : clientConvId,
-          thread_id: bridgeConversation ? bridgeConversation.threadId : sessionId,
+          thread_id: bridgeConversation
+            ? bridgeConversation.threadId
+            : sessionId,
           run_id: runId,
         });
 
@@ -358,14 +398,15 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
                   | undefined;
                 if (!request) return;
                 // 判定与构造拆在 approval-routes（buildPendingPermission）
-                const { permission, disposition, toolName } = buildPendingPermission({
-                  userId: identity.userId,
-                  sessionId,
-                  workspacePath,
-                  runId,
-                  executionId: foregroundExecutionId,
-                  request,
-                });
+                const { permission, disposition, toolName } =
+                  buildPendingPermission({
+                    userId: identity.userId,
+                    sessionId,
+                    workspacePath,
+                    runId,
+                    executionId: foregroundExecutionId,
+                    request,
+                  });
 
                 if (disposition === "auto_approve") {
                   void resolvePermission(permission, true).then((result) => {
@@ -398,8 +439,14 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
                 expiryTimer.unref?.();
                 // 旧前端契约：审批按钮在流式期间禁用，选项以 resume 字段随下一条
                 // 消息回传——因此 interrupt 之后必须给本流发终态，前端才能交互。
-                writeEvent(buildInterruptPayload(toolName, request.requestId), false);
-                writeEvent({ type: "done", run_id: runId, interrupted: true }, false);
+                writeEvent(
+                  buildInterruptPayload(toolName, request.requestId),
+                  false,
+                );
+                writeEvent(
+                  { type: "done", run_id: runId, interrupted: true },
+                  false,
+                );
                 settled = true;
                 interruptedEnd = true;
                 runRegistry.delete(runKey);
@@ -414,7 +461,10 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
                 | undefined;
               if (!event) return;
 
-              if (event.type === "part.delta" || event.type === "model.streaming") {
+              if (
+                event.type === "part.delta" ||
+                event.type === "model.streaming"
+              ) {
                 const payload = event.payload ?? {};
                 if (event.type === "model.streaming") {
                   // 流事件携带工具名：结果事件可能缺席 toolName，在此登记备查
@@ -437,7 +487,11 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
                   event.type === "part.delta"
                     ? payload.field === "text"
                     : payload.kind === "text_delta";
-                if (isText && typeof payload.delta === "string" && payload.delta) {
+                if (
+                  isText &&
+                  typeof payload.delta === "string" &&
+                  payload.delta
+                ) {
                   // 累计 assistant 全文（上限 64KB）：轮次结束时回写平台消息表
                   if (assistantText.length < ASSISTANT_TEXT_MAX) {
                     assistantText += payload.delta.slice(
@@ -445,7 +499,10 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
                       ASSISTANT_TEXT_MAX - assistantText.length,
                     );
                   }
-                  writeEvent({ type: "message_delta", content: payload.delta }, true);
+                  writeEvent(
+                    { type: "message_delta", content: payload.delta },
+                    true,
+                  );
                 }
                 return;
               }
@@ -468,12 +525,18 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
                   result?: unknown;
                   error?: { message?: string };
                 };
-                if (payload.kind === "scheduled" || payload.kind === "started") {
+                if (
+                  payload.kind === "scheduled" ||
+                  payload.kind === "started"
+                ) {
                   // 协议对同一 toolCallId 先后投递 scheduled 与 started 两个事件，
                   // 只发一次 tool_call，避免前端出现重复的“执行中”卡片；
                   // 审批前那条流已发过挂起工具的卡片，恢复流不再重复下发
                   if (emittedToolCalls.has(payload.toolCallId)) return;
-                  if (pendingResolution?.permission.toolCallId === payload.toolCallId) {
+                  if (
+                    pendingResolution?.permission.toolCallId ===
+                    payload.toolCallId
+                  ) {
                     emittedToolCalls.add(payload.toolCallId);
                     return;
                   }
@@ -490,13 +553,19 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
                     },
                     false,
                   );
-                } else if (payload.kind === "result" || payload.kind === "error") {
+                } else if (
+                  payload.kind === "result" ||
+                  payload.kind === "error"
+                ) {
                   // 结果事件的 toolName 可能缺席：优先用挂起阶段登记的名称
                   const toolName =
                     registeredToolNames.get(payload.toolCallId) ??
                     normalizeQuantToolName(payload.toolName ?? "");
                   // 部分投递通道只送达终态：为保证前端按 id 配对，补发缺失的 tool_call
-                  if (payload.toolCallId && !emittedToolCalls.has(payload.toolCallId)) {
+                  if (
+                    payload.toolCallId &&
+                    !emittedToolCalls.has(payload.toolCallId)
+                  ) {
                     emittedToolCalls.add(payload.toolCallId);
                     writeEvent(
                       {
@@ -700,7 +769,10 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
               },
               false,
             );
-            writeEvent({ type: "done", run_id: runId, truncated, timeout: true }, false);
+            writeEvent(
+              { type: "done", run_id: runId, truncated, timeout: true },
+              false,
+            );
           }
           settled = true;
           void rawAgentService

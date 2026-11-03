@@ -22,7 +22,10 @@ import {
 import { extractMiaoshouIdentity } from "./index.js";
 
 export interface ApprovalAgentLike {
-  sendConversationCommandV4(params: { workspacePath: string; envelope: unknown }): Promise<unknown>;
+  sendConversationCommandV4(params: {
+    workspacePath: string;
+    envelope: unknown;
+  }): Promise<unknown>;
 }
 
 export interface ApprovalDeps {
@@ -35,7 +38,10 @@ export async function resolvePermissionWith(
   permission: PendingPermission,
   wantAllow: boolean,
 ): Promise<{ ok: boolean; error?: string }> {
-  const optionId = selectPermissionOption(permission.options, wantAllow)?.optionId;
+  const optionId = selectPermissionOption(
+    permission.options,
+    wantAllow,
+  )?.optionId;
   if (wantAllow && !optionId) {
     return { ok: false, error: "permission options carry no allow choice" };
   }
@@ -99,7 +105,9 @@ export function buildPendingPermission(params: {
   disposition: PermissionDisposition;
   toolName: string;
 } {
-  const toolName = normalizeQuantToolName(String(params.request.toolName || ""));
+  const toolName = normalizeQuantToolName(
+    String(params.request.toolName || ""),
+  );
   const permission: PendingPermission = {
     userId: params.userId,
     sessionId: params.sessionId,
@@ -110,7 +118,10 @@ export function buildPendingPermission(params: {
     executionId: params.executionId,
     options: params.request.options,
   };
-  if (typeof params.request.toolCallId === "string" && params.request.toolCallId) {
+  if (
+    typeof params.request.toolCallId === "string" &&
+    params.request.toolCallId
+  ) {
     permission.toolCallId = params.request.toolCallId;
   }
   const disposition: PermissionDisposition = QUANT_READONLY_TOOLS.has(toolName)
@@ -172,7 +183,8 @@ export function parsePendingResume(
   const pendingEntry = trackedSessionId
     ? [...pendingPermissions.entries()].find(
         ([, permission]) =>
-          permission.userId === userId && permission.sessionId === trackedSessionId,
+          permission.userId === userId &&
+          permission.sessionId === trackedSessionId,
       )
     : undefined;
   if (!trackedSessionId || !pendingEntry) return { kind: "none" };
@@ -192,8 +204,10 @@ export function parsePendingResume(
 }
 
 export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
-  const resolvePermission = (permission: PendingPermission, wantAllow: boolean) =>
-    resolvePermissionWith(deps, permission, wantAllow);
+  const resolvePermission = (
+    permission: PendingPermission,
+    wantAllow: boolean,
+  ) => resolvePermissionWith(deps, permission, wantAllow);
   const sweepExpiredPending = () => sweepExpiredPendingWith(deps);
 
   // ── 审批回执：POST /api/agent/interrupts/:interruptId ──────────────────
@@ -224,7 +238,8 @@ export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
     }
     const wantAllow = rawValue === "allow";
     const result = await resolvePermission(permission, wantAllow);
-    if (!result.ok) return c.json({ detail: result.error ?? "审批提交失败" }, 500);
+    if (!result.ok)
+      return c.json({ detail: result.error ?? "审批提交失败" }, 500);
     pendingPermissions.delete(permission.requestId);
     if (!wantAllow) {
       // 拒绝路径 CLI 不再投递 ToolCallResult：终态记入待回放，
@@ -271,7 +286,9 @@ export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
         workspacePath: deps.workspacePath,
         envelope: buildCommandEnvelope(
           "stop",
-          expectedExecutionId ? { expectedForegroundExecutionId: expectedExecutionId } : {},
+          expectedExecutionId
+            ? { expectedForegroundExecutionId: expectedExecutionId }
+            : {},
           trackedRun.sessionId,
         ),
       });
@@ -283,7 +300,10 @@ export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
       runExecutionRegistry.delete(cancelKey);
       return c.json({ success: true });
     } catch (error) {
-      return c.json({ detail: error instanceof Error ? error.message : "取消失败" }, 500);
+      return c.json(
+        { detail: error instanceof Error ? error.message : "取消失败" },
+        500,
+      );
     }
   });
 

@@ -61,7 +61,9 @@ export interface MiaoshouBridgeContract {
    * 前置：servers 来自会话创建参数；identity 为 undefined 时不注入任何身份头。
    * 后置：返回新数组，不修改入参；纯函数、幂等。
    */
-  applyIdentityToMcpServers<T extends { name?: unknown; url?: unknown; headers?: unknown }>(
+  applyIdentityToMcpServers<
+    T extends { name?: unknown; url?: unknown; headers?: unknown },
+  >(
     servers: T[] | undefined,
     identity: MiaoshouUserIdentity | undefined,
   ): T[] | undefined;

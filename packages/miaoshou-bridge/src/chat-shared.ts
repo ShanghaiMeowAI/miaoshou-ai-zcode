@@ -72,10 +72,16 @@ export const pendingPermissions = new Map<string, PendingPermission>();
  * 记录下来由该会话的下一条聊天流开头补发（resume 流的拒绝已直接补发，不经此表）。
  * 每会话上限防止无界累积；空闲清扫在会话关闭时顺带回收。
  */
-const deniedToolResults = new Map<string, Array<{ toolCallId: string; content: string }>>();
+const deniedToolResults = new Map<
+  string,
+  Array<{ toolCallId: string; content: string }>
+>();
 const DENIED_TOOL_RESULTS_PER_SESSION = 20;
 
-export function recordDeniedToolResult(sessionId: string, toolCallId: string | undefined): void {
+export function recordDeniedToolResult(
+  sessionId: string,
+  toolCallId: string | undefined,
+): void {
   if (!toolCallId) return;
   const list = deniedToolResults.get(sessionId) ?? [];
   list.push({ toolCallId, content: "用户取消了该操作，未执行。" });
@@ -120,7 +126,11 @@ export function rememberTracked(
         userOldestKey = k;
       }
     }
-    if (userCount > userLimit && userOldestKey !== undefined && userOldestKey !== key) {
+    if (
+      userCount > userLimit &&
+      userOldestKey !== undefined &&
+      userOldestKey !== key
+    ) {
       const evicted = map.get(userOldestKey);
       map.delete(userOldestKey);
       if (evicted && onEvict) onEvict(evicted);
@@ -138,7 +148,9 @@ export function isCommandAckOk(ack: unknown): { ok: boolean; error?: string } {
   if (status === "accepted" || status === "duplicate" || status === "noop") {
     return { ok: true };
   }
-  const detail = [record?.reasonCode, record?.message].filter(Boolean).join(" ");
+  const detail = [record?.reasonCode, record?.message]
+    .filter(Boolean)
+    .join(" ");
   return { ok: false, error: `${status}${detail ? `: ${detail}` : ""}` };
 }
 
@@ -166,7 +178,9 @@ export function selectPermissionOption(
     `${option.kind} ${option.optionId} ${option.name}`.toLowerCase();
   if (wantAllow) {
     // 只选一次性放行，避免把会话级/项目级持久授权当成“批准一次”
-    const once = options.find((option) => kindOf(option).includes("allow_once"));
+    const once = options.find((option) =>
+      kindOf(option).includes("allow_once"),
+    );
     if (once) return { optionId: once.optionId };
     const transientAllow = options.find((option) => {
       const haystack = kindOf(option);
@@ -180,7 +194,11 @@ export function selectPermissionOption(
   }
   const deny = options.find((option) => {
     const haystack = kindOf(option);
-    return haystack.includes("deny") || haystack.includes("reject") || haystack.includes("cancel");
+    return (
+      haystack.includes("deny") ||
+      haystack.includes("reject") ||
+      haystack.includes("cancel")
+    );
   });
   return deny ? { optionId: deny.optionId } : undefined;
 }
@@ -275,7 +293,9 @@ export function buildToolResultPayload(params: {
 }
 
 export interface ProjectServiceLike {
-  readProjects(): Promise<Array<{ id?: unknown; roots?: unknown[] }> | undefined>;
+  readProjects(): Promise<
+    Array<{ id?: unknown; roots?: unknown[] }> | undefined
+  >;
   saveProject(input: {
     primaryRoot: string;
     roots: string[];
@@ -317,7 +337,10 @@ export function createProjectIdResolver(
         });
         return typeof created?.id === "string" ? created.id : undefined;
       } catch (error) {
-        console.error("[miaoshou-bridge] ensureProjectId 失败，本次不缓存，下次重试:", error);
+        console.error(
+          "[miaoshou-bridge] ensureProjectId 失败，本次不缓存，下次重试:",
+          error,
+        );
         projectIdCache.delete(workspacePath);
         return undefined;
       }

@@ -7,6 +7,7 @@
  * 量化工具服务；URL 不受信任的 quant 条目直接丢弃，身份缺失时不注入任何
  * 用户身份头（Quant MCP 中间件随之 401 拦截），防止跨用户数据串号。
  */
+import { createHmac } from "node:crypto";
 
 export interface MiaoshouUserIdentity {
   userId: string;
@@ -18,7 +19,11 @@ const HEADER_USER_ID = "x-user-id";
 const HEADER_USER_ROLE = "x-user-role";
 const HEADER_AUTHORIZATION = "authorization";
 const HEADER_PLATFORM_TOKEN = "x-platform-token";
-const IDENTITY_HEADER_NAMES = [HEADER_USER_ID, HEADER_USER_ROLE, HEADER_AUTHORIZATION];
+const IDENTITY_HEADER_NAMES = [
+  HEADER_USER_ID,
+  HEADER_USER_ROLE,
+  HEADER_AUTHORIZATION,
+];
 
 const DEFAULT_QUANT_SERVER_NAME = "quant";
 const DEFAULT_TRUSTED_QUANT_URL = "http://127.0.0.1:8005/mcp/";
@@ -29,7 +34,11 @@ export function quantServerName(): string {
 }
 
 export function trustedQuantUrl(): string {
-  const value = (process.env.MIAOSHOU_QUANT_URL || process.env.QUANT_MCP_URL || "").trim();
+  const value = (
+    process.env.MIAOSHOU_QUANT_URL ||
+    process.env.QUANT_MCP_URL ||
+    ""
+  ).trim();
   return normalizeQuantUrl(value || DEFAULT_TRUSTED_QUANT_URL);
 }
 
@@ -55,14 +64,22 @@ function bridgeDisabled(): boolean {
   return process.env.MIAOSHOU_BRIDGE_MODE?.trim() === "off";
 }
 
-export type HeaderBag = Headers | Record<string, string | string[] | undefined> | undefined;
+export type HeaderBag =
+  | Headers
+  | Record<string, string | string[] | undefined>
+  | undefined;
 
-function readSingleHeader(headers: HeaderBag, name: string): string | undefined {
+function readSingleHeader(
+  headers: HeaderBag,
+  name: string,
+): string | undefined {
   if (!headers) return undefined;
   if (typeof (headers as Headers).get === "function") {
     return (headers as Headers).get(name)?.trim() || undefined;
   }
-  for (const [key, value] of Object.entries(headers as Record<string, unknown>)) {
+  for (const [key, value] of Object.entries(
+    headers as Record<string, unknown>,
+  )) {
     if (key.toLowerCase() !== name) continue;
     if (Array.isArray(value)) return value[0]?.trim() || undefined;
     if (typeof value === "string") return value.trim() || undefined;
@@ -70,7 +87,9 @@ function readSingleHeader(headers: HeaderBag, name: string): string | undefined 
   return undefined;
 }
 
-export function extractMiaoshouIdentity(headers: HeaderBag): MiaoshouUserIdentity | undefined {
+export function extractMiaoshouIdentity(
+  headers: HeaderBag,
+): MiaoshouUserIdentity | undefined {
   const userId = readSingleHeader(headers, HEADER_USER_ID);
   if (!userId || !/^\d+$/.test(userId) || Number(userId) <= 0) {
     return undefined;
@@ -80,13 +99,63 @@ export function extractMiaoshouIdentity(headers: HeaderBag): MiaoshouUserIdentit
   const role = rawRole === "admin" ? "admin" : "user";
   // 平台 JWT 只经网关注入的 X-Platform-Token 传递（网关会用服务共享令牌覆盖
   // Authorization）；不做 Authorization 回退，避免把服务令牌当用户令牌转发。
-  const rawToken = readSingleHeader(headers, HEADER_PLATFORM_TOKEN) || undefined;
+  const rawToken =
+    readSingleHeader(headers, HEADER_PLATFORM_TOKEN) || undefined;
   const authorization = rawToken
     ? rawToken.startsWith("Bearer ") || rawToken.startsWith("bearer ")
       ? rawToken
       : `Bearer ${rawToken}`
     : undefined;
   return { userId, role, authorization };
+}
+
+/**
+ * 从 X-Miaoshou-JWT（Kong 透传的原始平台 JWT）验签并提取身份。
+ * Kong 的 Lua sandbox 不允许 require resty.jwt，验签由本侧（Node.js）完成：
+ * HMAC-SHA256 验签（密钥来自 MIAOSHOU_JWT_SECRET_KEY 环境变量）+ 过期检查。
+ * 验证通过返回 { userId, role, authorization }，否则 undefined。
+ */
+export function extractMiaoshouIdentityFromJWT(
+  headers: HeaderBag,
+): MiaoshouUserIdentity | undefined {
+  const rawJwt = readSingleHeader(headers, "x-miaoshou-jwt");
+  if (!rawJwt) return undefined;
+  const secret = process.env.MIAOSHOU_JWT_SECRET_KEY?.trim();
+  if (!secret) return undefined;
+  const parts = rawJwt.split(".");
+  if (parts.length !== 3) return undefined;
+  const [headerB64, payloadB64, signatureB64] = parts;
+
+  // HMAC-SHA256 验签
+  const crypto = createHmac("sha256", secret);
+  crypto.update(`${headerB64}.${payloadB64}`);
+  const expected = crypto.digest("base64url");
+  if (expected !== signatureB64) return undefined;
+
+  // 解码 payload
+  let claims: {
+    sub?: string;
+    type?: string;
+    exp?: number;
+    platform_role?: string;
+  };
+  try {
+    claims = JSON.parse(Buffer.from(payloadB64!, "base64url").toString("utf8"));
+  } catch {
+    return undefined;
+  }
+  if (!claims.sub || !/^\d+$/.test(claims.sub) || Number(claims.sub) <= 0)
+    return undefined;
+  if (claims.type !== "access") return undefined;
+  if (typeof claims.exp === "number" && claims.exp * 1000 < Date.now())
+    return undefined;
+
+  const role = claims.platform_role === "admin" ? "admin" : "user";
+  return {
+    userId: claims.sub,
+    role,
+    authorization: `Bearer ${rawJwt}`,
+  };
 }
 
 export function identityHeaderEntries(
@@ -109,7 +178,10 @@ interface McpServerLike {
 }
 
 function isIdentityHeader(name: unknown): boolean {
-  return typeof name === "string" && IDENTITY_HEADER_NAMES.includes(name.trim().toLowerCase());
+  return (
+    typeof name === "string" &&
+    IDENTITY_HEADER_NAMES.includes(name.trim().toLowerCase())
+  );
 }
 
 /**
@@ -130,9 +202,13 @@ export function applyIdentityToMcpServers<T extends McpServerLike>(
       if (server?.name !== target) return true;
       // 凭据保护：只信任指向配置端点的 quant 条目；客户端自带同名但指向
       // 其它地址的条目一律丢弃，防止把用户凭据发往调用方可控的 URL。
-      const url = normalizeQuantUrl(typeof server.url === "string" ? server.url : "");
+      const url = normalizeQuantUrl(
+        typeof server.url === "string" ? server.url : "",
+      );
       if (url !== trustedUrl) {
-        console.warn(`[miaoshou-bridge] 丢弃 url 不受信任的 quant MCP 条目: ${String(server.url)}`);
+        console.warn(
+          `[miaoshou-bridge] 丢弃 url 不受信任的 quant MCP 条目: ${String(server.url)}`,
+        );
         return false;
       }
       return true;
@@ -140,11 +216,15 @@ export function applyIdentityToMcpServers<T extends McpServerLike>(
     .map((server) => {
       if (server?.name !== target) return server;
       const preserved = Array.isArray(server.headers)
-        ? server.headers.filter((entry: { name?: unknown }) => !isIdentityHeader(entry?.name))
+        ? server.headers.filter(
+            (entry: { name?: unknown }) => !isIdentityHeader(entry?.name),
+          )
         : [];
       return {
         ...server,
-        headers: identity ? [...preserved, ...identityHeaderEntries(identity)] : preserved, // 身份缺失时不注入任何用户身份头，Quant MCP 中间件直接 401 拦截
+        headers: identity
+          ? [...preserved, ...identityHeaderEntries(identity)]
+          : preserved, // 身份缺失时不注入任何用户身份头，Quant MCP 中间件直接 401 拦截
       };
     });
 }
@@ -238,7 +318,11 @@ export function registerSessionOwner(sessionId: string, userId: string): void {
       oldestKey = key;
     }
   }
-  if (userCount > SESSION_OWNERS_PER_USER && oldestKey !== undefined && oldestKey !== sessionId) {
+  if (
+    userCount > SESSION_OWNERS_PER_USER &&
+    oldestKey !== undefined &&
+    oldestKey !== sessionId
+  ) {
     sessionOwners.delete(oldestKey);
   }
 }
@@ -274,7 +358,8 @@ function resolveSessionIds(params: unknown): string[] {
       if (typeof item === "string" && item) ids.push(item);
     }
   }
-  const envelope = (params as { envelope?: { sessionId?: unknown } }).envelope?.sessionId;
+  const envelope = (params as { envelope?: { sessionId?: unknown } }).envelope
+    ?.sessionId;
   if (typeof envelope === "string" && envelope) ids.push(envelope);
   return ids;
 }
@@ -324,13 +409,17 @@ async function filterOwnedListSessions(
   args: unknown[],
 ): Promise<unknown> {
   const result = await original.apply(target, args);
-  const sessions = Array.isArray(result) ? result : (result as { sessions?: unknown[] })?.sessions;
+  const sessions = Array.isArray(result)
+    ? result
+    : (result as { sessions?: unknown[] })?.sessions;
   if (!Array.isArray(sessions)) return result;
   const owned = sessions.filter((item) => {
     const sid = (item as { sessionId?: string })?.sessionId;
     return typeof sid === "string" && ownerOf(sid) === identity.userId;
   });
-  return Array.isArray(result) ? owned : { ...(result as object), sessions: owned };
+  return Array.isArray(result)
+    ? owned
+    : { ...(result as object), sessions: owned };
 }
 
 /**
@@ -356,10 +445,12 @@ function createIdentityScopedSessionService<T extends object>(
 
       if (identity) {
         if (method === "listSessions") {
-          return (...args: unknown[]) => filterOwnedListSessions(target, original, identity, args);
+          return (...args: unknown[]) =>
+            filterOwnedListSessions(target, original, identity, args);
         }
         if (IDENTITY_ALLOWED_SESSION_METHODS.has(method)) {
-          return (...args: unknown[]) => gatedForward(target, original, identity, method, args);
+          return (...args: unknown[]) =>
+            gatedForward(target, original, identity, method, args);
         }
         // 默认拒绝：sendPrompt（跨租户注入）、sendConversationCommandV4
         // （可伪造审批回执）、createSession/resumeSession（绕过工具面收口）、

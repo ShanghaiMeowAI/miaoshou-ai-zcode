@@ -39,6 +39,9 @@ export function exampleMiaoshouBridge(
   }
   // 每个 WebSocket 连接：提取网关注入的身份并包装会话服务
   const identity = contractBinding.extractMiaoshouIdentity(headers);
-  const scoped = contractBinding.wrapZCodeAgentServiceWithIdentity(rawService, identity);
+  const scoped = contractBinding.wrapZCodeAgentServiceWithIdentity(
+    rawService,
+    identity,
+  );
   void scoped;
 }

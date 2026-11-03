@@ -19,10 +19,16 @@ function internalBaseUrl(): string {
 }
 
 function internalSecret(): string | undefined {
-  return process.env.QUANT_MCP_INTERNAL_SECRET || process.env.MIAOSHOU_QUANT_INTERNAL_SECRET;
+  return (
+    process.env.QUANT_MCP_INTERNAL_SECRET ||
+    process.env.MIAOSHOU_QUANT_INTERNAL_SECRET
+  );
 }
 
-async function internalPost(path: string, body: unknown): Promise<unknown | undefined> {
+async function internalPost(
+  path: string,
+  body: unknown,
+): Promise<unknown | undefined> {
   const secret = internalSecret();
   if (!secret) return undefined;
   try {
@@ -68,7 +74,11 @@ export async function createBridgeConversation(
     thread_id: threadId,
     title,
   })) as { id?: unknown; thread_id?: unknown } | undefined;
-  if (!result || typeof result.id !== "number" || typeof result.thread_id !== "string") {
+  if (
+    !result ||
+    typeof result.id !== "number" ||
+    typeof result.thread_id !== "string"
+  ) {
     return undefined;
   }
   const conversation = { id: result.id, threadId: result.thread_id };
@@ -82,10 +92,14 @@ export async function lookupBridgeConversation(
 ): Promise<BridgeConversation | undefined> {
   const cached = CONVERSATION_LOOKUP_CACHE.get(conversationId);
   if (cached) return cached;
-  const result = (await internalGet(`/internal/bridge/conversations/${conversationId}`)) as
-    | { id?: unknown; thread_id?: unknown }
-    | undefined;
-  if (!result || typeof result.id !== "number" || typeof result.thread_id !== "string") {
+  const result = (await internalGet(
+    `/internal/bridge/conversations/${conversationId}`,
+  )) as { id?: unknown; thread_id?: unknown } | undefined;
+  if (
+    !result ||
+    typeof result.id !== "number" ||
+    typeof result.thread_id !== "string"
+  ) {
     return undefined;
   }
   const conversation = { id: result.id, threadId: result.thread_id };
