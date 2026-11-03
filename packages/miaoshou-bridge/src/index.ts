@@ -7,7 +7,6 @@
  * 量化工具服务；URL 不受信任的 quant 条目直接丢弃，身份缺失时不注入任何
  * 用户身份头（Quant MCP 中间件随之 401 拦截），防止跨用户数据串号。
  */
-import { createHmac } from "node:crypto";
 
 export interface MiaoshouUserIdentity {
   userId: string;

@@ -22,10 +22,7 @@ import {
 import { extractMiaoshouIdentity } from "./index.js";
 
 export interface ApprovalAgentLike {
-  sendConversationCommandV4(params: {
-    workspacePath: string;
-    envelope: unknown;
-  }): Promise<unknown>;
+  sendConversationCommandV4(params: { workspacePath: string; envelope: unknown }): Promise<unknown>;
 }
 
 export interface ApprovalDeps {
@@ -38,10 +35,7 @@ export async function resolvePermissionWith(
   permission: PendingPermission,
   wantAllow: boolean,
 ): Promise<{ ok: boolean; error?: string }> {
-  const optionId = selectPermissionOption(
-    permission.options,
-    wantAllow,
-  )?.optionId;
+  const optionId = selectPermissionOption(permission.options, wantAllow)?.optionId;
   if (wantAllow && !optionId) {
     return { ok: false, error: "permission options carry no allow choice" };
   }
@@ -75,7 +69,7 @@ export function sweepExpiredPendingWith(deps: ApprovalDeps): void {
   for (const [requestId, permission] of pendingPermissions) {
     if (now - permission.createdAt > PENDING_PERMISSION_TTL_MS) {
       void resolvePermissionWith(deps, permission, false).catch(() => {});
-      recordDeniedToolResult(permission.sessionId, permission.toolCallId);
+      recordDeniedToolResult(permission.sessionId, permission.toolCallId, permission.toolName);
       pendingPermissions.delete(requestId);
     }
   }
@@ -105,23 +99,19 @@ export function buildPendingPermission(params: {
   disposition: PermissionDisposition;
   toolName: string;
 } {
-  const toolName = normalizeQuantToolName(
-    String(params.request.toolName || ""),
-  );
+  const toolName = normalizeQuantToolName(String(params.request.toolName || ""));
   const permission: PendingPermission = {
     userId: params.userId,
     sessionId: params.sessionId,
     workspacePath: params.workspacePath,
     requestId: params.request.requestId,
     createdAt: Date.now(),
+    toolName,
     runId: params.runId,
     executionId: params.executionId,
     options: params.request.options,
   };
-  if (
-    typeof params.request.toolCallId === "string" &&
-    params.request.toolCallId
-  ) {
+  if (typeof params.request.toolCallId === "string" && params.request.toolCallId) {
     permission.toolCallId = params.request.toolCallId;
   }
   const disposition: PermissionDisposition = QUANT_READONLY_TOOLS.has(toolName)
@@ -165,7 +155,11 @@ export function buildInterruptPayload(
  */
 export type ResumeResolution =
   | { kind: "none" }
-  | { kind: "invalid_value" }
+  | {
+      kind: "invalid_value";
+      requestId: string;
+      permission: PendingPermission;
+    }
   | {
       kind: "resolved";
       requestId: string;
@@ -183,8 +177,7 @@ export function parsePendingResume(
   const pendingEntry = trackedSessionId
     ? [...pendingPermissions.entries()].find(
         ([, permission]) =>
-          permission.userId === userId &&
-          permission.sessionId === trackedSessionId,
+          permission.userId === userId && permission.sessionId === trackedSessionId,
       )
     : undefined;
   if (!trackedSessionId || !pendingEntry) return { kind: "none" };
@@ -193,7 +186,9 @@ export function parsePendingResume(
     .trim()
     .toLowerCase();
   if (resumeValue !== "allow" && resumeValue !== "deny") {
-    return { kind: "invalid_value" };
+    // 非法 value 大多是"审批挂起时用户输入了文本"（旧前端把文本塞进 resume.value）：
+    // 带出审批对象供调用方隐式拒绝并降级为普通对话，不再 400 打断用户
+    return { kind: "invalid_value", requestId, permission };
   }
   return {
     kind: "resolved",
@@ -203,11 +198,85 @@ export function parsePendingResume(
   };
 }
 
-export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
-  const resolvePermission = (
+/**
+ * 观察流中的 permission.request(ed) 事件处理（顶层或嵌套在 session.event 内
+ * 均可）：提取请求、判定处置（只读→自动放行；量化写工具→挂起等用户回执；
+ * 其余→拒绝）。挂起处置经 hooks.suspendStream 交给调用方收尾本流。
+ * 返回 true 表示事件已被本函数消费，调用方直接处理下一条。
+ */
+export interface PermissionStreamHooks {
+  writeEvent(payload: unknown, isDelta?: boolean): void;
+  setFinalDone(event: Record<string, unknown>): void;
+  /** 挂起处置：登记挂起审批、记录卡片、下发 interrupt 并终态化本流 */
+  suspendStream(permission: PendingPermission, interruptPayload: unknown): void;
+  onAutoApproveError(toolName: string, error?: string): void;
+}
+
+export function handlePermissionRequestedEvent(params: {
+  serviceEvent: { type?: string } & Record<string, unknown>;
+  userId: string;
+  sessionId: string;
+  workspacePath: string;
+  runId: string;
+  executionId: string | undefined;
+  resolve: (
     permission: PendingPermission,
     wantAllow: boolean,
-  ) => resolvePermissionWith(deps, permission, wantAllow);
+  ) => Promise<{ ok: boolean; error?: string }>;
+  hooks: PermissionStreamHooks;
+}): boolean {
+  const serviceEvent = params.serviceEvent;
+  let rawReq: any;
+  if (serviceEvent.type === "permission.request" || serviceEvent.type === "permission.requested") {
+    rawReq = serviceEvent.request ?? serviceEvent.payload ?? serviceEvent;
+  } else if (
+    serviceEvent.type === "session.event" &&
+    serviceEvent.event &&
+    typeof serviceEvent.event === "object"
+  ) {
+    const inner = serviceEvent.event as { type?: string; payload?: any };
+    if (inner.type === "permission.request" || inner.type === "permission.requested") {
+      rawReq = inner.payload ?? inner;
+    }
+  }
+  if (!rawReq || !(rawReq.toolName || rawReq.name)) return false;
+
+  const request = {
+    requestId: String(rawReq.requestId || rawReq.id || `req_${Date.now()}`),
+    toolName: String(rawReq.toolName || rawReq.name || ""),
+    toolCallId: rawReq.toolCallId ? String(rawReq.toolCallId) : undefined,
+    options: rawReq.options,
+  };
+  // 判定与构造拆在本模块（buildPendingPermission）
+  const { permission, disposition, toolName } = buildPendingPermission({
+    userId: params.userId,
+    sessionId: params.sessionId,
+    workspacePath: params.workspacePath,
+    runId: params.runId,
+    executionId: params.executionId,
+    request,
+  });
+
+  if (disposition === "auto_approve") {
+    void params.resolve(permission, true).then((result) => {
+      if (!result.ok) {
+        params.hooks.onAutoApproveError(toolName, result.error);
+      }
+    });
+    return true;
+  }
+  if (disposition === "reject") {
+    // 非量化工具一律拒绝，避免未评估的能力被静默执行
+    void params.resolve(permission, false).catch(() => {});
+    return true;
+  }
+  params.hooks.suspendStream(permission, buildInterruptPayload(toolName, request.requestId));
+  return true;
+}
+
+export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
+  const resolvePermission = (permission: PendingPermission, wantAllow: boolean) =>
+    resolvePermissionWith(deps, permission, wantAllow);
   const sweepExpiredPending = () => sweepExpiredPendingWith(deps);
 
   // ── 审批回执：POST /api/agent/interrupts/:interruptId ──────────────────
@@ -223,7 +292,7 @@ export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
     if (Date.now() - permission.createdAt > PENDING_PERMISSION_TTL_MS) {
       // 与 resume 分支同一 TTL 口径：过期审批一律拒绝，不允许跨期提交
       void resolvePermission(permission, false).catch(() => {});
-      recordDeniedToolResult(permission.sessionId, permission.toolCallId);
+      recordDeniedToolResult(permission.sessionId, permission.toolCallId, permission.toolName);
       pendingPermissions.delete(permission.requestId);
       return c.json({ detail: "审批已过期，操作已被自动拒绝" }, 410);
     }
@@ -238,8 +307,7 @@ export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
     }
     const wantAllow = rawValue === "allow";
     const result = await resolvePermission(permission, wantAllow);
-    if (!result.ok)
-      return c.json({ detail: result.error ?? "审批提交失败" }, 500);
+    if (!result.ok) return c.json({ detail: result.error ?? "审批提交失败" }, 500);
     pendingPermissions.delete(permission.requestId);
     if (!wantAllow) {
       // 拒绝路径 CLI 不再投递 ToolCallResult：终态记入待回放，
@@ -288,9 +356,7 @@ export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
         workspacePath: deps.workspacePath,
         envelope: buildCommandEnvelope(
           "stop",
-          expectedExecutionId
-            ? { expectedForegroundExecutionId: expectedExecutionId }
-            : {},
+          expectedExecutionId ? { expectedForegroundExecutionId: expectedExecutionId } : {},
           trackedRun.sessionId,
         ),
       });
@@ -302,10 +368,7 @@ export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
       runExecutionRegistry.delete(cancelKey);
       return c.json({ success: true });
     } catch (error) {
-      return c.json(
-        { detail: error instanceof Error ? error.message : "取消失败" },
-        500,
-      );
+      return c.json({ detail: error instanceof Error ? error.message : "取消失败" }, 500);
     }
   };
   app.post("/api/agent/runs/:runId/cancel", handleCancel);
@@ -318,12 +381,6 @@ export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
       note: "状态已记录；停止执行请调用 cancel 接口",
     });
   };
-  app.post(
-    "/api/agent/conversations/:id/runs/:runId/interrupted",
-    handleInterrupted,
-  );
-  app.post(
-    "/agent/api/agent/conversations/:id/runs/:runId/interrupted",
-    handleInterrupted,
-  );
+  app.post("/api/agent/conversations/:id/runs/:runId/interrupted", handleInterrupted);
+  app.post("/agent/api/agent/conversations/:id/runs/:runId/interrupted", handleInterrupted);
 }

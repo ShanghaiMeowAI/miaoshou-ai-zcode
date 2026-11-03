@@ -1,0 +1,153 @@
+/**
+ * 观察流中的会话事件处理：模型流式的工具名登记、文本增量累计与工具卡片
+ * 生命周期。从 chat-stream-route 拆出以守住单文件行数门禁。
+ * 可变累计状态经 accumulator 以引用传入，函数内就地更新。
+ */
+import {
+  ASSISTANT_TEXT_MAX,
+  buildToolResultPayload,
+  eventToolName,
+  normalizeQuantToolName,
+} from "./chat-shared.js";
+
+export interface StreamAccumulator {
+  assistantText: string;
+  truncated: boolean;
+  stickyTruncated: boolean;
+  queuedDeltaBytes: number;
+}
+
+/** 处理单个 session.event。返回 true 表示事件已被本函数消费。 */
+export function handleSessionEvent(params: {
+  event: { type: string; payload?: Record<string, unknown> };
+  accumulator: StreamAccumulator;
+  runId: string;
+  recordedBlocks: Array<Record<string, unknown>>;
+  emittedToolCalls: Set<string | undefined>;
+  registeredToolNames: Map<string | undefined, string>;
+  /** resume 流回执的挂起工具：审批前的卡片已在上一条流发过，跳过重复下发 */
+  resumedToolCallId?: string;
+  writeEvent: (payload: unknown, isDelta?: boolean) => void;
+}): boolean {
+  const { event, accumulator: acc } = params;
+  const payload = event.payload ?? {};
+
+  if (event.type === "part.delta" || event.type === "model.streaming") {
+    if (event.type === "model.streaming") {
+      // 流事件携带工具名：结果事件可能缺席 toolName，在此登记备查
+      const streaming = payload as {
+        toolCallId?: string;
+        toolName?: string;
+      };
+      if (
+        streaming.toolCallId &&
+        streaming.toolName &&
+        !params.registeredToolNames.has(streaming.toolCallId)
+      ) {
+        params.registeredToolNames.set(
+          streaming.toolCallId,
+          normalizeQuantToolName(streaming.toolName),
+        );
+      }
+    }
+    const isText =
+      event.type === "part.delta" ? payload.field === "text" : payload.kind === "text_delta";
+    if (isText && typeof payload.delta === "string" && payload.delta) {
+      // 累计 assistant 全文（上限 64KB）：轮次结束时回写平台消息表
+      if (acc.assistantText.length < ASSISTANT_TEXT_MAX) {
+        acc.assistantText += payload.delta.slice(0, ASSISTANT_TEXT_MAX - acc.assistantText.length);
+      }
+      const lastBlock = params.recordedBlocks[params.recordedBlocks.length - 1];
+      if (lastBlock && lastBlock.type === "text") {
+        lastBlock.content = String(lastBlock.content || "") + payload.delta;
+      } else {
+        params.recordedBlocks.push({
+          type: "text",
+          content: payload.delta,
+        });
+      }
+      params.writeEvent({ type: "message_delta", content: payload.delta }, true);
+    }
+    return true;
+  }
+
+  if (event.type === "tool.updated") {
+    const toolPayload = payload as {
+      kind?: string;
+      toolCallId?: string;
+      toolName?: string;
+      input?: unknown;
+      result?: unknown;
+      error?: { message?: string };
+    };
+    if (toolPayload.kind === "scheduled" || toolPayload.kind === "started") {
+      // 协议对同一 toolCallId 先后投递 scheduled 与 started 两个事件，
+      // 只发一次 tool_call，避免前端出现重复的“执行中”卡片；
+      // 审批前那条流已发过挂起工具的卡片，恢复流不再重复下发
+      if (params.emittedToolCalls.has(toolPayload.toolCallId)) return true;
+      if (params.resumedToolCallId === toolPayload.toolCallId) {
+        params.emittedToolCalls.add(toolPayload.toolCallId);
+        return true;
+      }
+      const toolName =
+        params.registeredToolNames.get(toolPayload.toolCallId) ??
+        normalizeQuantToolName(toolPayload.toolName ?? "");
+      params.emittedToolCalls.add(toolPayload.toolCallId);
+      params.recordedBlocks.push({
+        type: "tool_call",
+        id: toolPayload.toolCallId,
+        name: eventToolName(toolName),
+        args: toolPayload.input,
+      });
+      params.writeEvent(
+        {
+          type: "tool_call",
+          id: toolPayload.toolCallId,
+          name: eventToolName(toolName),
+          args: toolPayload.input,
+        },
+        false,
+      );
+      return true;
+    }
+    if (toolPayload.kind === "result" || toolPayload.kind === "error") {
+      // 结果事件的 toolName 可能缺席：优先用挂起阶段登记的名称
+      const toolName =
+        params.registeredToolNames.get(toolPayload.toolCallId) ??
+        normalizeQuantToolName(toolPayload.toolName ?? "");
+      // 部分投递通道只送达终态：为保证前端按 id 配对，补发缺失的 tool_call
+      if (toolPayload.toolCallId && !params.emittedToolCalls.has(toolPayload.toolCallId)) {
+        params.emittedToolCalls.add(toolPayload.toolCallId);
+        params.writeEvent(
+          {
+            type: "tool_call",
+            id: toolPayload.toolCallId,
+            name: eventToolName(toolName),
+          },
+          false,
+        );
+      }
+      // 旧前端契约：content 是工具输出的业务文本（不是结果信封），
+      // ok 字段供前端判成败（构造与判定拆在 chat-shared）
+      const trPayload = buildToolResultPayload({
+        toolCallId: toolPayload.toolCallId!,
+        toolName,
+        kind: toolPayload.kind,
+        result: toolPayload.result,
+        errorMessage: toolPayload.error?.message,
+      });
+      for (let bi = params.recordedBlocks.length - 1; bi >= 0; bi--) {
+        const blk = params.recordedBlocks[bi];
+        if (blk && blk.type === "tool_call" && blk.id === toolPayload.toolCallId) {
+          blk.result = trPayload.content;
+          break;
+        }
+      }
+      params.writeEvent(trPayload, false);
+      return true;
+    }
+    return true;
+  }
+
+  return false;
+}

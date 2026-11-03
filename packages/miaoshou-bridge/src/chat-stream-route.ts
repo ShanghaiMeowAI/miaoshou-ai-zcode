@@ -1,10 +1,6 @@
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
-import {
-  IZCodeAgentService,
-  IProjectService,
-  type ServiceCollection,
-} from "@zcode/services";
+import { IZCodeAgentService, IProjectService, type ServiceCollection } from "@zcode/services";
 import {
   applyIdentityToMcpServers,
   clearSessionOwner,
@@ -21,22 +17,18 @@ import {
   MAX_RUNS_PER_USER,
   MAX_TRACKED_PER_USER,
   PENDING_PERMISSION_TTL_MS,
-  QUANT_MUTATION_TOOLS,
-  QUANT_READONLY_TOOLS,
   SESSION_IDLE_SWEEP_INTERVAL_MS,
   SESSION_IDLE_TTL_MS,
   SESSION_TOOL_DENYLIST,
   STREAM_TIMEOUT_MS,
   buildCommandEnvelope,
-  buildToolResultPayload,
   conversationSessionMap,
   createProjectIdResolver,
-  drainDeniedToolResults,
   dropDeniedToolResults,
   eventToolName,
-  normalizeQuantToolName,
   pendingPermissions,
   occupyStreamSlot,
+  recordDeniedToolResult,
   rememberTracked,
   runExecutionRegistry,
   runRegistry,
@@ -44,27 +36,23 @@ import {
 } from "./chat-shared.js";
 import { registerChatGuard } from "./chat-registration.js";
 import {
-  buildInterruptPayload,
-  buildPendingPermission,
+  handlePermissionRequestedEvent,
   parsePendingResume,
   registerApprovalRoutes,
   resolvePermissionWith,
   sweepExpiredPendingWith,
 } from "./approval-routes.js";
+import { handleSessionEvent, type StreamAccumulator } from "./chat-stream-events.js";
 import {
-  appendBridgeMessages,
-  resolveBridgeConversation,
-} from "./bridge-internal-client.js";
+  awaitTurnPersist,
+  persistResumeUserAction,
+  persistTurnResult,
+  replayDeniedToolResults,
+} from "./chat-persistence.js";
+import { resolveBridgeConversation } from "./bridge-internal-client.js";
 
-/** assistant 全文的累计上限（回写平台消息表时的截断保护） */
-const ASSISTANT_TEXT_MAX = 64 * 1024;
-
-export function registerMiaoshouChatRoutes(
-  app: Hono,
-  services: ServiceCollection,
-): void {
-  const workspacePath =
-    process.env.ZCODE_SERVER_WORKSPACE?.trim() || DEFAULT_WORKSPACE_PATH;
+export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollection): void {
+  const workspacePath = process.env.ZCODE_SERVER_WORKSPACE?.trim() || DEFAULT_WORKSPACE_PATH;
   // 注册守卫（令牌/密钥检查、healthz 探针、quant 模板装配）拆在 chat-registration；
   // 未通过守卫时业务路由不注册，探针仍可观测真实原因
   const registration = registerChatGuard(app);
@@ -114,20 +102,13 @@ export function registerMiaoshouChatRoutes(
    * 确保工作区拥有 projectId（ZCode Server 远程客户端创建会话必需）。
    * 结果按 workspacePath 缓存，避免每条消息重复扫描项目库。
    */
-  const ensureProjectId = createProjectIdResolver(
-    projectService,
-    workspacePath,
-  );
+  const ensureProjectId = createProjectIdResolver(projectService, workspacePath);
 
   const resolvePermission = (
     permission: PendingPermission,
     wantAllow: boolean,
   ): Promise<{ ok: boolean; error?: string }> =>
-    resolvePermissionWith(
-      { workspacePath, rawAgentService },
-      permission,
-      wantAllow,
-    );
+    resolvePermissionWith({ workspacePath, rawAgentService }, permission, wantAllow);
 
   // ── 核心流式对话接口：POST /api/agent/chat ─────────────────────────────
   // 兼顾带 /agent 网关前缀（前端实际请求基地址）与不带前缀两种路径
@@ -135,10 +116,7 @@ export function registerMiaoshouChatRoutes(
     // 平台惯例：Kong jwt-auth 验签并注入 X-User-ID，Bridge 信任网关身份头
     const identity = extractMiaoshouIdentity(c.req.raw.headers);
     if (!identity) {
-      return c.json(
-        { detail: "未登录或缺少身份凭证（需网关注入的 X-User-ID）" },
-        401,
-      );
+      return c.json({ detail: "未登录或缺少身份凭证（需网关注入的 X-User-ID）" }, 401);
     }
 
     const body = await c.req.json().catch(() => null);
@@ -150,9 +128,7 @@ export function registerMiaoshouChatRoutes(
     const resumePayload = body.resume;
     let isResume = Boolean(resumePayload && typeof resumePayload === "object");
     const runId =
-      typeof body.run_id === "string" && body.run_id
-        ? body.run_id
-        : `run_${Date.now()}`;
+      typeof body.run_id === "string" && body.run_id ? body.run_id : `run_${Date.now()}`;
 
     if (!isResume && !message.trim()) {
       return c.json({ detail: "message 不能为空" }, 400);
@@ -209,14 +185,26 @@ export function registerMiaoshouChatRoutes(
         }
       }
       if (resolution.kind === "invalid_value") {
-        releaseStreamSlot();
-        return c.json(
-          {
-            detail:
-              "审批回执的 value 只接受 allow 或 deny；文本追问请在审批完成后再发送",
-          },
-          400,
+        // 审批挂起时用户输入文本 → 旧前端把文本塞进 resume.value：按"隐式取消"处理，
+        // 自动拒绝挂起审批（带待回放终态），文本降级为新指令继续对话，
+        // 不再 400 静默吞掉输入（用户会误以为卡死）。文本为空时仍显式拒绝。
+        if (!message.trim()) {
+          releaseStreamSlot();
+          return c.json(
+            {
+              detail: "审批回执的 value 只接受 allow 或 deny；文本追问请在审批完成后再发送",
+            },
+            400,
+          );
+        }
+        void resolvePermission(resolution.permission, false).catch(() => {});
+        recordDeniedToolResult(
+          resolution.permission.sessionId,
+          resolution.permission.toolCallId,
+          resolution.permission.toolName,
         );
+        pendingPermissions.delete(resolution.requestId);
+        isResume = false;
       }
       if (resolution.kind === "resolved") {
         pendingResolution = resolution;
@@ -244,10 +232,7 @@ export function registerMiaoshouChatRoutes(
           mode: "build",
           toolDenylist: SESSION_TOOL_DENYLIST,
           mcpServers:
-            applyIdentityToMcpServers(
-              [structuredClone(quantServerTemplate)],
-              identity,
-            ) ?? [],
+            applyIdentityToMcpServers([structuredClone(quantServerTemplate)], identity) ?? [],
         });
         sessionId = snapshot.session.sessionId;
         registerSessionOwner(sessionId, identity.userId);
@@ -274,10 +259,7 @@ export function registerMiaoshouChatRoutes(
       }
     } catch (error) {
       releaseStreamSlot();
-      return c.json(
-        { detail: error instanceof Error ? error.message : "会话准备失败" },
-        500,
-      );
+      return c.json({ detail: error instanceof Error ? error.message : "会话准备失败" }, 500);
     }
     const runKey = `${identity.userId}:${runId}`;
     rememberTracked(runRegistry, runKey, tracked, undefined, MAX_RUNS_PER_USER);
@@ -299,28 +281,30 @@ export function registerMiaoshouChatRoutes(
         const emittedToolCalls = new Set<string | undefined>();
         const registeredToolNames = new Map<string | undefined, string>();
         let foregroundExecutionId: string | undefined;
-        let truncated = false;
-        let stickyTruncated = false;
-        let queuedDeltaBytes = 0;
         let interruptedEnd = false;
+        // 正常/异常收尾的 done 终态延后到回写落库之后再发：前端收到 done 会立刻
+        // 从数据库重拉消息，回写若未完成，审批卡片与工具卡片会被旧数据覆盖回退
+        let finalDoneEvent: Record<string, unknown> | undefined;
 
         const writeEvent = (payload: unknown, isDelta = false): void => {
           if (settled) return;
           let serialized: string | undefined;
           if (isDelta) {
             // 粘性截断：一旦触发丢弃，后续正文全部不再发送，避免中间出现空洞
-            if (stickyTruncated || queuedDeltaBytes > MAX_QUEUED_DELTA_BYTES) {
-              if (!stickyTruncated) {
-                stickyTruncated = true;
-                truncated = true;
+            if (
+              accumulator.stickyTruncated ||
+              accumulator.queuedDeltaBytes > MAX_QUEUED_DELTA_BYTES
+            ) {
+              if (!accumulator.stickyTruncated) {
+                accumulator.stickyTruncated = true;
+                accumulator.truncated = true;
                 // 截断必须给用户可见提示，否则慢客户端看到的是静默半截答案
                 writeChain = writeChain
                   .then(() =>
                     stream.writeSSE({
                       data: JSON.stringify({
                         type: "message_delta",
-                        content:
-                          "\n\n[回答过长，输出已截断；可收窄问题范围后重试]",
+                        content: "\n\n[回答过长，输出已截断；可收窄问题范围后重试]",
                       }),
                     }),
                   )
@@ -329,7 +313,7 @@ export function registerMiaoshouChatRoutes(
               return;
             }
             serialized = JSON.stringify(payload);
-            queuedDeltaBytes += Buffer.byteLength(serialized, "utf8");
+            accumulator.queuedDeltaBytes += Buffer.byteLength(serialized, "utf8");
           }
           const text = serialized ?? JSON.stringify(payload);
           writeChain = writeChain
@@ -337,9 +321,16 @@ export function registerMiaoshouChatRoutes(
             .catch(() => {})
             .then(() => {
               if (isDelta && serialized) {
-                queuedDeltaBytes -= Buffer.byteLength(serialized, "utf8");
+                accumulator.queuedDeltaBytes -= Buffer.byteLength(serialized, "utf8");
               }
             });
+        };
+        // 终态专用写入：绕过 settled 检查——done 延后到回写落库后的收尾段才发，
+        // 那时 settled 已置位，普通 writeEvent 会把终态丢弃
+        const writeFinalEvent = (payload: unknown): void => {
+          writeChain = writeChain
+            .then(() => stream.writeSSE({ data: JSON.stringify(payload) }))
+            .catch(() => {});
         };
 
         const heartbeat = setInterval(() => {
@@ -350,8 +341,13 @@ export function registerMiaoshouChatRoutes(
         cleanupFns.push(() => clearInterval(heartbeat));
 
         // assistant 全文累计与结构化 blocks 收集（回写平台消息表用，防止刷新后工具卡片丢失）
-        let assistantText = "";
         const recordedBlocks: Array<Record<string, unknown>> = [];
+        const accumulator: StreamAccumulator = {
+          assistantText: "",
+          truncated: false,
+          stickyTruncated: false,
+          queuedDeltaBytes: 0,
+        };
 
         let clientAborted = false;
         stream.onAbort(() => {
@@ -368,9 +364,7 @@ export function registerMiaoshouChatRoutes(
           // 数字编号优先（旧前端 Number(id) 非整数直接丢弃，会话路由就断了）；
           // 回写降级时下发临时标识，前端不采纳但对话仍继续
           id: bridgeConversation ? String(bridgeConversation.id) : clientConvId,
-          thread_id: bridgeConversation
-            ? bridgeConversation.threadId
-            : sessionId,
+          thread_id: bridgeConversation ? bridgeConversation.threadId : sessionId,
           run_id: runId,
         });
 
@@ -379,111 +373,77 @@ export function registerMiaoshouChatRoutes(
           sessionId,
           deliveryKind: "web-remote-replayable",
         });
+        // 审批挂起处置：登记挂起、记录卡片、下发 interrupt 并终态化本流
+        const suspendStream = (permission: PendingPermission, interruptPayload: unknown): void => {
+          pendingPermissions.set(permission.requestId, permission);
+          // 主动过期：用户不回来操作时到点自动拒绝，避免权限请求永久悬挂卡死会话
+          const expiryTimer = setTimeout(() => {
+            if (pendingPermissions.delete(permission.requestId)) {
+              void resolvePermission(permission, false).catch(() => {});
+            }
+          }, PENDING_PERMISSION_TTL_MS);
+          expiryTimer.unref?.();
+          // 旧前端契约：审批按钮在流式期间禁用，选项以 resume 字段随下一条
+          // 消息回传——因此 interrupt 之后必须给本流发终态，前端才能交互。
+          const payload = interruptPayload as {
+            question: string;
+            options: Array<{ label: string; value: string }>;
+          };
+          recordedBlocks.push({
+            type: "interrupt",
+            interruptId: permission.requestId,
+            question: payload.question,
+            options: payload.options,
+            allowCustom: false,
+          });
+          writeEvent(interruptPayload, false);
+          // done 同样延后到回写落库之后：interrupt 卡片已记入 blocks，
+          // 提前发 done 会让前端的重拉拿不到审批卡片
+          finalDoneEvent = {
+            type: "done",
+            run_id: runId,
+            interrupted: true,
+          };
+          settled = true;
+          interruptedEnd = true;
+          runRegistry.delete(runKey);
+          runExecutionRegistry.delete(runKey);
+          finishSignal.resolve();
+        };
         const disposable = subscription(
           (serviceEvent: { type?: string } & Record<string, unknown>) => {
             try {
-              // 兼容 permission.request 与 ZCode 核心协议的 permission.requested
-              // 无论是顶层事件还是嵌套在 session.event 内，统一提取并处理
-              let rawReq: any;
-              if (
-                serviceEvent.type === "permission.request" ||
-                serviceEvent.type === "permission.requested"
-              ) {
-                rawReq =
-                  serviceEvent.request ?? serviceEvent.payload ?? serviceEvent;
-              } else if (
-                serviceEvent.type === "session.event" &&
-                serviceEvent.event &&
-                typeof serviceEvent.event === "object"
-              ) {
-                const inner = serviceEvent.event as {
-                  type?: string;
-                  payload?: any;
-                };
-                if (
-                  inner.type === "permission.request" ||
-                  inner.type === "permission.requested"
-                ) {
-                  rawReq = inner.payload ?? inner;
-                }
-              }
-
-              if (rawReq && (rawReq.toolName || rawReq.name)) {
-                const request = {
-                  requestId: String(
-                    rawReq.requestId || rawReq.id || `req_${Date.now()}`,
-                  ),
-                  toolName: String(rawReq.toolName || rawReq.name || ""),
-                  toolCallId: rawReq.toolCallId
-                    ? String(rawReq.toolCallId)
-                    : undefined,
-                  options: rawReq.options,
-                };
-                // 判定与构造拆在 approval-routes（buildPendingPermission）
-                const { permission, disposition, toolName } =
-                  buildPendingPermission({
-                    userId: identity.userId,
-                    sessionId,
-                    workspacePath,
-                    runId,
-                    executionId: foregroundExecutionId,
-                    request,
-                  });
-
-                if (disposition === "auto_approve") {
-                  void resolvePermission(permission, true).then((result) => {
-                    if (!result.ok) {
-                      writeEvent(
-                        {
-                          type: "error",
-                          message: `只读工具 ${toolName} 自动放行失败：${result.error ?? "未知错误"}`,
-                          error: result.error ?? "auto-approve failed",
-                          run_id: runId,
-                        },
-                        false,
-                      );
-                    }
-                  });
-                  return;
-                }
-                if (disposition === "reject") {
-                  // 非量化工具一律拒绝，避免未评估的能力被静默执行
-                  void resolvePermission(permission, false).catch(() => {});
-                  return;
-                }
-                pendingPermissions.set(request.requestId, permission);
-                // 主动过期：用户不回来操作时到点自动拒绝，避免权限请求永久悬挂卡死会话
-                const expiryTimer = setTimeout(() => {
-                  if (pendingPermissions.delete(request.requestId)) {
-                    void resolvePermission(permission, false).catch(() => {});
-                  }
-                }, PENDING_PERMISSION_TTL_MS);
-                expiryTimer.unref?.();
-                // 旧前端契约：审批按钮在流式期间禁用，选项以 resume 字段随下一条
-                // 消息回传——因此 interrupt 之后必须给本流发终态，前端才能交互。
-                const interruptPayload = buildInterruptPayload(
-                  toolName,
-                  request.requestId,
-                );
-                recordedBlocks.push({
-                  type: "interrupt",
-                  interruptId: request.requestId,
-                  question: interruptPayload.question,
-                  options: interruptPayload.options,
-                  allowCustom: false,
-                });
-                writeEvent(interruptPayload, false);
-                writeEvent(
-                  { type: "done", run_id: runId, interrupted: true },
-                  false,
-                );
-                settled = true;
-                interruptedEnd = true;
-                runRegistry.delete(runKey);
-                runExecutionRegistry.delete(runKey);
-                finishSignal.resolve();
-                return;
-              }
+              // 审批事件处理拆在 approval-routes(handlePermissionRequestedEvent):
+              // 兼容 permission.request 与核心协议 permission.requested、
+              // 顶层与嵌套 session.event 两种载荷形态
+              const handled = handlePermissionRequestedEvent({
+                serviceEvent,
+                userId: identity.userId,
+                sessionId,
+                workspacePath,
+                runId,
+                executionId: foregroundExecutionId,
+                resolve: resolvePermission,
+                hooks: {
+                  writeEvent,
+                  setFinalDone: (done) => {
+                    finalDoneEvent = done;
+                  },
+                  suspendStream,
+                  onAutoApproveError: (toolName, error) => {
+                    writeEvent(
+                      {
+                        type: "error",
+                        message: `只读工具 ${toolName} 自动放行失败：${error ?? "未知错误"}`,
+                        error: error ?? "auto-approve failed",
+                        run_id: runId,
+                      },
+                      false,
+                    );
+                  },
+                },
+              });
+              if (handled) return;
 
               if (serviceEvent.type !== "session.event") return;
               const event = serviceEvent.event as
@@ -491,59 +451,19 @@ export function registerMiaoshouChatRoutes(
                 | undefined;
               if (!event) return;
 
+              // 文本增量、工具名登记与工具卡片生命周期拆在 chat-stream-events
               if (
-                event.type === "part.delta" ||
-                event.type === "model.streaming"
+                handleSessionEvent({
+                  event,
+                  accumulator,
+                  runId,
+                  recordedBlocks,
+                  emittedToolCalls,
+                  registeredToolNames,
+                  resumedToolCallId: pendingResolution?.permission.toolCallId,
+                  writeEvent,
+                })
               ) {
-                const payload = event.payload ?? {};
-                if (event.type === "model.streaming") {
-                  // 流事件携带工具名：结果事件可能缺席 toolName，在此登记备查
-                  const streaming = payload as {
-                    toolCallId?: string;
-                    toolName?: string;
-                  };
-                  if (
-                    streaming.toolCallId &&
-                    streaming.toolName &&
-                    !registeredToolNames.has(streaming.toolCallId)
-                  ) {
-                    registeredToolNames.set(
-                      streaming.toolCallId,
-                      normalizeQuantToolName(streaming.toolName),
-                    );
-                  }
-                }
-                const isText =
-                  event.type === "part.delta"
-                    ? payload.field === "text"
-                    : payload.kind === "text_delta";
-                if (
-                  isText &&
-                  typeof payload.delta === "string" &&
-                  payload.delta
-                ) {
-                  // 累计 assistant 全文（上限 64KB）：轮次结束时回写平台消息表
-                  if (assistantText.length < ASSISTANT_TEXT_MAX) {
-                    assistantText += payload.delta.slice(
-                      0,
-                      ASSISTANT_TEXT_MAX - assistantText.length,
-                    );
-                  }
-                  const lastBlock = recordedBlocks[recordedBlocks.length - 1];
-                  if (lastBlock && lastBlock.type === "text") {
-                    lastBlock.content =
-                      String(lastBlock.content || "") + payload.delta;
-                  } else {
-                    recordedBlocks.push({
-                      type: "text",
-                      content: payload.delta,
-                    });
-                  }
-                  writeEvent(
-                    { type: "message_delta", content: payload.delta },
-                    true,
-                  );
-                }
                 return;
               }
 
@@ -552,97 +472,6 @@ export function registerMiaoshouChatRoutes(
                 if (typeof executionId === "string" && executionId) {
                   foregroundExecutionId = executionId;
                   runExecutionRegistry.set(runKey, executionId);
-                }
-                return;
-              }
-
-              if (event.type === "tool.updated") {
-                const payload = (event.payload ?? {}) as {
-                  kind?: string;
-                  toolCallId?: string;
-                  toolName?: string;
-                  input?: unknown;
-                  result?: unknown;
-                  error?: { message?: string };
-                };
-                if (
-                  payload.kind === "scheduled" ||
-                  payload.kind === "started"
-                ) {
-                  // 协议对同一 toolCallId 先后投递 scheduled 与 started 两个事件，
-                  // 只发一次 tool_call，避免前端出现重复的“执行中”卡片；
-                  // 审批前那条流已发过挂起工具的卡片，恢复流不再重复下发
-                  if (emittedToolCalls.has(payload.toolCallId)) return;
-                  if (
-                    pendingResolution?.permission.toolCallId ===
-                    payload.toolCallId
-                  ) {
-                    emittedToolCalls.add(payload.toolCallId);
-                    return;
-                  }
-                  const toolName =
-                    registeredToolNames.get(payload.toolCallId) ??
-                    normalizeQuantToolName(payload.toolName ?? "");
-                  emittedToolCalls.add(payload.toolCallId);
-                  recordedBlocks.push({
-                    type: "tool_call",
-                    id: payload.toolCallId,
-                    name: eventToolName(toolName),
-                    args: payload.input,
-                  });
-                  writeEvent(
-                    {
-                      type: "tool_call",
-                      id: payload.toolCallId,
-                      name: eventToolName(toolName),
-                      args: payload.input,
-                    },
-                    false,
-                  );
-                } else if (
-                  payload.kind === "result" ||
-                  payload.kind === "error"
-                ) {
-                  // 结果事件的 toolName 可能缺席：优先用挂起阶段登记的名称
-                  const toolName =
-                    registeredToolNames.get(payload.toolCallId) ??
-                    normalizeQuantToolName(payload.toolName ?? "");
-                  // 部分投递通道只送达终态：为保证前端按 id 配对，补发缺失的 tool_call
-                  if (
-                    payload.toolCallId &&
-                    !emittedToolCalls.has(payload.toolCallId)
-                  ) {
-                    emittedToolCalls.add(payload.toolCallId);
-                    writeEvent(
-                      {
-                        type: "tool_call",
-                        id: payload.toolCallId,
-                        name: eventToolName(toolName),
-                      },
-                      false,
-                    );
-                  }
-                  // 旧前端契约：content 是工具输出的业务文本（不是结果信封），
-                  // ok 字段供前端判成败（构造与判定拆在 chat-shared）
-                  const trPayload = buildToolResultPayload({
-                    toolCallId: payload.toolCallId!,
-                    toolName,
-                    kind: payload.kind,
-                    result: payload.result,
-                    errorMessage: payload.error?.message,
-                  });
-                  for (let bi = recordedBlocks.length - 1; bi >= 0; bi--) {
-                    const blk = recordedBlocks[bi];
-                    if (
-                      blk &&
-                      blk.type === "tool_call" &&
-                      blk.id === payload.toolCallId
-                    ) {
-                      blk.result = trPayload.content;
-                      break;
-                    }
-                  }
-                  writeEvent(trPayload, false);
                 }
                 return;
               }
@@ -667,14 +496,11 @@ export function registerMiaoshouChatRoutes(
                     false,
                   );
                 }
-                writeEvent(
-                  {
-                    type: "done",
-                    run_id: runId,
-                    truncated,
-                  },
-                  false,
-                );
+                finalDoneEvent = {
+                  type: "done",
+                  run_id: runId,
+                  truncated: accumulator.truncated,
+                };
                 settled = true;
                 runRegistry.delete(runKey);
                 runExecutionRegistry.delete(runKey);
@@ -692,7 +518,11 @@ export function registerMiaoshouChatRoutes(
                   },
                   false,
                 );
-                writeEvent({ type: "done", run_id: runId, truncated }, false);
+                finalDoneEvent = {
+                  type: "done",
+                  run_id: runId,
+                  truncated: accumulator.truncated,
+                };
                 settled = true;
                 runRegistry.delete(runKey);
                 runExecutionRegistry.delete(runKey);
@@ -710,20 +540,21 @@ export function registerMiaoshouChatRoutes(
           } catch {}
         });
 
+        // resume 轮的用户动作（批准执行/取消操作）立即落库：前端以
+        // "审批卡片后面的用户消息"判定审批已处理，动作晚落库会让执行
+        // 期间的重拉把审批卡片复活成待处理
+        if (
+          isResume &&
+          pendingResolution &&
+          tracked.conversationId !== undefined &&
+          message.trim()
+        ) {
+          persistResumeUserAction(tracked.conversationId, message);
+        }
+
         // 端点回执 / TTL 过期拒绝的 tool_result 终态在此补发：这些路径没有
         // 观察流，只有本流（该会话的下一条消息）能把终态带给前端
-        for (const denied of drainDeniedToolResults(sessionId)) {
-          emittedToolCalls.add(denied.toolCallId);
-          writeEvent(
-            {
-              type: "tool_result",
-              id: denied.toolCallId,
-              ok: false,
-              content: denied.content,
-            },
-            false,
-          );
-        }
+        replayDeniedToolResults(sessionId, recordedBlocks, emittedToolCalls, writeEvent);
 
         // 回执动作在订阅建立之后执行：被批准工具立刻产出的事件就能被本流捕获，
         // 不会落在"回执已提交、订阅尚未挂上"的间隙里丢失终态。
@@ -747,17 +578,24 @@ export function registerMiaoshouChatRoutes(
               },
               false,
             );
-            writeEvent({ type: "done", run_id: runId }, false);
+            finalDoneEvent = { type: "done", run_id: runId };
             settled = true;
             finishSignal.resolve();
           } else {
             pendingPermissions.delete(pendingResolution.requestId);
             if (!pendingResolution.wantAllow) {
               // CLI 在权限被拒后不再投递 ToolCallResult：这里补 tool_result
-              // 终态，否则前端那张"执行中"卡片永远不收口
+              // 终态，否则前端那张"执行中"卡片永远不收口；同时记入 blocks
+              // 保证刷新后回显不丢
               const deniedToolCallId = pendingResolution.permission.toolCallId;
               if (deniedToolCallId) {
                 emittedToolCalls.add(deniedToolCallId);
+                recordedBlocks.push({
+                  type: "tool_call",
+                  id: deniedToolCallId,
+                  name: eventToolName(pendingResolution.permission.toolName),
+                  result: "用户取消了该操作，未执行。",
+                });
                 writeEvent(
                   {
                     type: "tool_result",
@@ -803,7 +641,7 @@ export function registerMiaoshouChatRoutes(
                 },
                 false,
               );
-              writeEvent({ type: "done", run_id: runId }, false);
+              finalDoneEvent = { type: "done", run_id: runId };
               settled = true;
               finishSignal.resolve();
             });
@@ -824,10 +662,12 @@ export function registerMiaoshouChatRoutes(
               },
               false,
             );
-            writeEvent(
-              { type: "done", run_id: runId, truncated, timeout: true },
-              false,
-            );
+            finalDoneEvent = {
+              type: "done",
+              run_id: runId,
+              truncated: accumulator.truncated,
+              timeout: true,
+            };
           }
           settled = true;
           void rawAgentService
@@ -845,36 +685,22 @@ export function registerMiaoshouChatRoutes(
         }
         // heartbeat/订阅/超时句柄的释放统一由 finally 的 cleanupFns 执行，
         // 此处不再重复清理
-        // 慢客户端可能让写队列长时间不排空：终态之后最多再等 5 秒即放弃冲刷
-        await Promise.race([
-          writeChain,
-          new Promise((resolve) => {
-            const flushTimer = setTimeout(resolve, 5_000);
-            flushTimer.unref?.();
-          }),
-        ]);
         runRegistry.delete(runKey);
         runExecutionRegistry.delete(runKey);
-        // 轮次结束把对话回写平台消息表（不阻塞流收尾；失败只记日志——
-        // 回写是展示层需求，绝不能因它打断对话）
-        if (!isResume && tracked.conversationId !== undefined) {
-          void appendBridgeMessages(tracked.conversationId, [
-            { role: "user", content: message },
-            {
-              role: "assistant",
-              content: assistantText || "（本轮没有文本回复）",
-              extra:
-                recordedBlocks.length > 0
-                  ? { blocks: recordedBlocks }
-                  : undefined,
-            },
-          ]).then((ok) => {
-            if (!ok) {
-              console.error(
-                `[miaoshou-bridge] 会话 ${tracked.conversationId} 的消息回写失败（对话不受影响）`,
-              );
-            }
-          });
+        // 轮次结束把对话回写平台消息表：经会话串行链写入，保证审批轮与
+        // resume 轮的落库先后顺序（乱序会让前端 markResolvedInterrupts
+        // 判错，审批卡片复活成待处理）。落库逻辑拆在 chat-persistence；
+        // 超时兜底 8 秒后照常发 done，对话本身不因落库受阻
+        if (tracked.conversationId !== undefined) {
+          await awaitTurnPersist(
+            persistTurnResult({
+              conversationId: tracked.conversationId,
+              isResume,
+              message,
+              assistantText: accumulator.assistantText,
+              recordedBlocks,
+            }),
+          );
         }
         // 保留本会话挂起的审批等待 resume 回执；流因超时等原因结束且无人应答时，
         // 直接拒绝避免工具悬挂
@@ -886,6 +712,19 @@ export function registerMiaoshouChatRoutes(
             }
           });
         }
+        // 消息已落库（或兜底超时）才发终态：前端收到 done 会立即重拉消息，
+        // 提前发会让审批卡片与工具卡片被数据库旧数据覆盖回退
+        if (finalDoneEvent) {
+          writeFinalEvent(finalDoneEvent);
+        }
+        // 慢客户端可能让写队列长时间不排空：终态之后最多再等 5 秒即放弃冲刷
+        await Promise.race([
+          writeChain,
+          new Promise((resolve) => {
+            const flushTimer = setTimeout(resolve, 5_000);
+            flushTimer.unref?.();
+          }),
+        ]);
       } finally {
         for (const cleanup of cleanupFns) {
           try {
