@@ -21,9 +21,10 @@ jobs:
 
       - name: Install (filtered)
         run: >
-          pnpm install --filter @zcode/server --filter @zcode/shared
-          --filter @zcode/services --filter @zcode/provider
-          --filter @zcode/provider-node --filter @miaoshou/bridge
+          pnpm install --filter "./apps/zcode-cli/packages/*"
+          --filter @zcode/shared --filter @zcode/services
+          --filter @zcode/provider --filter @zcode/provider-node
+          --filter @zcode/server --filter @miaoshou/bridge
 
       - name: Typecheck bridge
         run: pnpm --filter @miaoshou/bridge run typecheck
@@ -45,7 +46,7 @@ jobs:
           key: ${{ secrets.MIAOSHOU_SSH_KEY }}
           port: 22
           timeout: 30s
-          command_timeout: 15m
+          command_timeout: 20m
           script_stop: true
           script: |
             if [ ! -d /var/www/miaoshou-ai-zcode ]; then

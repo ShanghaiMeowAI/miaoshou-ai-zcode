@@ -31,8 +31,13 @@ fi
 corepack enable
 # provider/provider-node 必须显式加入：server 构建期加载 provider-node 源码做
 # 内置 provider 配置校验，pnpm 过滤安装不会为 services 的 workspace 依赖建链接
-pnpm install --filter @zcode/server --filter @zcode/shared --filter @zcode/services --filter @zcode/provider --filter @zcode/provider-node --filter @miaoshou/bridge
+pnpm install --filter "./apps/zcode-cli/packages/*" --filter @zcode/shared --filter @zcode/services --filter @zcode/provider --filter @zcode/provider-node --filter @zcode/server --filter @miaoshou/bridge
 pnpm --filter @zcode/server run build
+# CLI 是 agent 会话的子进程引擎，必须构建出 dist/zcode.cjs
+# （tsc 逐包串行构建，turbo 并发会因 SIGTERM 不稳定）
+for pkg in @zcode/shared-types @zcode/dynamic-workflow @zcode/dynamic-workflow-runtime @zcode/contracts @zcode/i18n @zcode/telemetry @zcode/core @zcode/adapters @zcode/bootstrap @zcode/cli; do
+  pnpm --filter "$pkg" run build || { echo "构建 $pkg 失败" >&2; exit 1; }
+done
 
 mkdir -p workspace
 # 环境经 --update-env 继承本 shell（.env.production 已 export），
