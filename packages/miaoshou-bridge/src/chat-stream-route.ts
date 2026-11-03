@@ -9,7 +9,6 @@ import {
   applyIdentityToMcpServers,
   clearSessionOwner,
   extractMiaoshouIdentity,
-  extractMiaoshouIdentityFromJWT,
   registerSessionOwner,
   sweepSessionOwners,
 } from "./index.js";
@@ -132,11 +131,8 @@ export function registerMiaoshouChatRoutes(
 
   // ── 核心流式对话接口：POST /api/agent/chat ─────────────────────────────
   app.post("/api/agent/chat", async (c) => {
-    // 身份提取优先从 Kong 透传的原始 JWT 验签（安全性最高，不可伪造），
-    // 网关直接注入的 X-User-ID 头作为兜底（本地联调或网关不做 JWT 透传时）
-    const identity =
-      extractMiaoshouIdentityFromJWT(c.req.raw.headers) ??
-      extractMiaoshouIdentity(c.req.raw.headers);
+    // 平台惯例：Kong jwt-auth 验签并注入 X-User-ID，Bridge 信任网关身份头
+    const identity = extractMiaoshouIdentity(c.req.raw.headers);
     if (!identity) {
       return c.json(
         { detail: "未登录或缺少身份凭证（需网关注入的 X-User-ID）" },

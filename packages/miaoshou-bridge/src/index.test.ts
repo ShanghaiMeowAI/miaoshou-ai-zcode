@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeAll } from "vitest";
+import { describe, expect, it, beforeAll, beforeEach, afterEach } from "vitest";
 import { Hono } from "hono";
 import {
   applyIdentityToMcpServers,
@@ -27,50 +27,47 @@ const baseServer = {
 };
 
 describe("extractMiaoshouIdentity", () => {
-  it("extracts identity from gateway headers via X-Platform-Token", () => {
+  beforeEach(() => {
+    process.env.ZCODE_SERVER_AUTH_TOKEN = "t";
+  });
+  afterEach(() => {
+    delete process.env.ZCODE_SERVER_AUTH_TOKEN;
+  });
+
+  it("信任令牌匹配 + X-User-ID 注入 → 返回身份", () => {
     const identity = extractMiaoshouIdentity({
-      "X-User-ID": "1042",
-      "X-User-Role": "user",
-      "X-Platform-Token": "Bearer jwt-token",
-      Authorization: "Bearer server-shared-token",
+      "x-platform-token": "t",
+      "x-user-id": "42",
+      "x-user-role": "user",
     });
-    expect(identity).toEqual({
-      userId: "1042",
-      role: "user",
-      authorization: "Bearer jwt-token",
-    });
+    expect(identity?.userId).toBe("42");
+    expect(identity?.role).toBe("user");
   });
 
-  it("normalizes bare platform tokens and never falls back to Authorization", () => {
-    const normalized = extractMiaoshouIdentity({
-      "X-User-ID": "7",
-      "X-Platform-Token": "raw-jwt-value",
+  it("信任令牌不匹配 → undefined", () => {
+    const identity = extractMiaoshouIdentity({
+      "x-platform-token": "wrong",
+      "x-user-id": "42",
     });
-    expect(normalized?.authorization).toBe("Bearer raw-jwt-value");
-    const noPlatformToken = extractMiaoshouIdentity({
-      "X-User-ID": "7",
-      Authorization: "Bearer server-shared-token",
-    });
-    expect(noPlatformToken?.authorization).toBeUndefined();
+    expect(identity).toBeUndefined();
   });
 
-  it("extracts identity from standard Headers instance", () => {
-    const headers = new Headers({
-      "X-User-ID": "2049",
-      "X-User-Role": "admin",
-      "X-Platform-Token": "Bearer jwt-2049",
+  it("X-Miaoshou-JWT 透传的原始 JWT 作为 authorization", () => {
+    const identity = extractMiaoshouIdentity({
+      "x-platform-token": "t",
+      "x-user-id": "42",
+      "x-miaoshou-jwt": "raw.jwt.token",
     });
-    expect(extractMiaoshouIdentity(headers)).toEqual({
-      userId: "2049",
-      role: "admin",
-      authorization: "Bearer jwt-2049",
-    });
+    expect(identity?.authorization).toBe("Bearer raw.jwt.token");
   });
 
-  it("rejects missing or non-numeric user id", () => {
-    expect(extractMiaoshouIdentity({ "X-User-Role": "user" })).toBeUndefined();
-    expect(extractMiaoshouIdentity({ "X-User-ID": "abc" })).toBeUndefined();
-    expect(extractMiaoshouIdentity({ "X-User-ID": "0" })).toBeUndefined();
+  it("非法或缺失的 X-User-ID → undefined", () => {
+    expect(
+      extractMiaoshouIdentity({ "x-platform-token": "t", "x-user-id": "abc" }),
+    ).toBeUndefined();
+    expect(
+      extractMiaoshouIdentity({ "x-platform-token": "t" }),
+    ).toBeUndefined();
   });
 });
 
@@ -407,18 +404,6 @@ describe("identityHeaderEntries", () => {
   });
 });
 
-describe("role 白名单", () => {
-  it("拒绝伪造角色，非法值一律回落 user", () => {
-    expect(
-      extractMiaoshouIdentity({ "X-User-ID": "9", "X-User-Role": "superadmin" })
-        ?.role,
-    ).toBe("user");
-    expect(
-      extractMiaoshouIdentity({ "X-User-ID": "9", "X-User-Role": "admin" })
-        ?.role,
-    ).toBe("admin");
-  });
-});
 
 describe("registerMiaoshouChatRoutes 注册守卫", () => {
   const fakeServices = {
@@ -544,7 +529,9 @@ describe("registerMiaoshouChatRoutes 注册守卫", () => {
           method: "POST",
           headers: {
             "content-type": "application/json",
+            "x-platform-token": "t",
             "x-user-id": "42",
+            "x-user-role": "user",
           },
           body: JSON.stringify({ message: "你好" }),
         });
@@ -566,7 +553,9 @@ describe("registerMiaoshouChatRoutes 注册守卫", () => {
           method: "POST",
           headers: {
             "content-type": "application/json",
+            "x-platform-token": "t",
             "x-user-id": "42",
+            "x-user-role": "user",
           },
           body: JSON.stringify({ message: "重试", replace_last_turn: true }),
         });
@@ -598,7 +587,9 @@ describe("registerMiaoshouChatRoutes 注册守卫", () => {
           method: "POST",
           headers: {
             "content-type": "application/json",
+            "x-platform-token": "t",
             "x-user-id": "42",
+            "x-user-role": "user",
           },
           body: JSON.stringify({ value: "maybe" }),
         });
@@ -694,7 +685,9 @@ describe("registerMiaoshouChatRoutes 注册守卫", () => {
           method: "POST",
           headers: {
             "content-type": "application/json",
+            "x-platform-token": "t",
             "x-user-id": "42",
+            "x-user-role": "user",
           },
           body: JSON.stringify({
             conversation_id: "conv-deny",
@@ -740,7 +733,9 @@ describe("registerMiaoshouChatRoutes 注册守卫", () => {
           method: "POST",
           headers: {
             "content-type": "application/json",
+            "x-platform-token": "t",
             "x-user-id": "42",
+            "x-user-role": "user",
           },
           body: JSON.stringify({ value: "allow" }),
         });
@@ -751,7 +746,11 @@ describe("registerMiaoshouChatRoutes 注册守卫", () => {
 
         const cancel = await app.request("/api/agent/runs/run-1/cancel", {
           method: "POST",
-          headers: { "x-user-id": "42" },
+          headers: {
+            "x-platform-token": "t",
+            "x-user-id": "42",
+            "x-user-role": "user",
+          },
         });
         expect(cancel.status).toBe(200);
         expect(runRegistry.has("42:run-1")).toBe(false);

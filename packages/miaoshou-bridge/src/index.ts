@@ -90,72 +90,25 @@ function readSingleHeader(
 export function extractMiaoshouIdentity(
   headers: HeaderBag,
 ): MiaoshouUserIdentity | undefined {
+  // 平台惯例：Kong 全局 jwt-auth 验签并注入 X-User-ID/X-User-Role，
+  // 后端信任网关注入的身份头（与旧服务一致），不自行解析 JWT。
+  // 信任判定：X-Platform-Token 必须等于共享服务令牌（证明经过网关）
+  const platformToken = readSingleHeader(headers, HEADER_PLATFORM_TOKEN);
+  const sharedToken = process.env.ZCODE_SERVER_AUTH_TOKEN?.trim();
+  if (!sharedToken || platformToken !== sharedToken) return undefined;
+
   const userId = readSingleHeader(headers, HEADER_USER_ID);
   if (!userId || !/^\d+$/.test(userId) || Number(userId) <= 0) {
     return undefined;
   }
   const rawRole = readSingleHeader(headers, HEADER_USER_ROLE) || "user";
-  // 角色白名单：只接受 user/admin，其它值一律回落 user，防止伪造角色提权
   const role = rawRole === "admin" ? "admin" : "user";
-  // 平台 JWT 只经网关注入的 X-Platform-Token 传递（网关会用服务共享令牌覆盖
-  // Authorization）；不做 Authorization 回退，避免把服务令牌当用户令牌转发。
-  const rawToken =
-    readSingleHeader(headers, HEADER_PLATFORM_TOKEN) || undefined;
-  const authorization = rawToken
-    ? rawToken.startsWith("Bearer ") || rawToken.startsWith("bearer ")
-      ? rawToken
-      : `Bearer ${rawToken}`
-    : undefined;
-  return { userId, role, authorization };
-}
 
-/**
- * 从 X-Miaoshou-JWT（Kong 透传的原始平台 JWT）验签并提取身份。
- * Kong 的 Lua sandbox 不允许 require resty.jwt，验签由本侧（Node.js）完成：
- * HMAC-SHA256 验签（密钥来自 MIAOSHOU_JWT_SECRET_KEY 环境变量）+ 过期检查。
- * 验证通过返回 { userId, role, authorization }，否则 undefined。
- */
-export function extractMiaoshouIdentityFromJWT(
-  headers: HeaderBag,
-): MiaoshouUserIdentity | undefined {
+  // 原始 JWT 经 X-Miaoshou-JWT 透传（Kong 替换了 Authorization 为共享令牌后，
+  // 原始 JWT 存在这里供 MCP/AST 调用使用）
   const rawJwt = readSingleHeader(headers, "x-miaoshou-jwt");
-  if (!rawJwt) return undefined;
-  const secret = process.env.MIAOSHOU_JWT_SECRET_KEY?.trim();
-  if (!secret) return undefined;
-  const parts = rawJwt.split(".");
-  if (parts.length !== 3) return undefined;
-  const [headerB64, payloadB64, signatureB64] = parts;
-
-  // HMAC-SHA256 验签
-  const crypto = createHmac("sha256", secret);
-  crypto.update(`${headerB64}.${payloadB64}`);
-  const expected = crypto.digest("base64url");
-  if (expected !== signatureB64) return undefined;
-
-  // 解码 payload
-  let claims: {
-    sub?: string;
-    type?: string;
-    exp?: number;
-    platform_role?: string;
-  };
-  try {
-    claims = JSON.parse(Buffer.from(payloadB64!, "base64url").toString("utf8"));
-  } catch {
-    return undefined;
-  }
-  if (!claims.sub || !/^\d+$/.test(claims.sub) || Number(claims.sub) <= 0)
-    return undefined;
-  if (claims.type !== "access") return undefined;
-  if (typeof claims.exp === "number" && claims.exp * 1000 < Date.now())
-    return undefined;
-
-  const role = claims.platform_role === "admin" ? "admin" : "user";
-  return {
-    userId: claims.sub,
-    role,
-    authorization: `Bearer ${rawJwt}`,
-  };
+  const authorization = rawJwt ? `Bearer ${rawJwt}` : undefined;
+  return { userId, role, authorization };
 }
 
 export function identityHeaderEntries(
