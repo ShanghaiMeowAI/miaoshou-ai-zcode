@@ -24,6 +24,7 @@ import {
   ServiceCollection,
   IZCodeAgentService,
   createZCodeAgentConnectionScope,
+  IZCodeSessionService,
   IBotsService,
   IProviderProvisioningTargetService,
 } from "@zcode/services";
@@ -32,6 +33,7 @@ import {
   formatLogPrefix,
   serverRemoteInfoOutputSchema,
   SERVER_REMOTE_PROTOCOL_VERSION,
+  ServiceChannels,
   ZCODE_RPC_HOST_CAPABILITY_HEADER,
   ZCODE_COMPATIBILITY_MANIFEST,
   ZCODE_VERSION,
@@ -43,6 +45,14 @@ import {
   SourceServerWorkspaceIdentityChannelServer,
   type SourceServerWorkspaceIdentityMapper,
 } from "@zcode/services/node";
+import {
+  extractMiaoshouIdentity,
+  identityTrustEnabled,
+  wrapZCodeAgentServiceWithIdentity,
+  wrapZCodeSessionServiceWithIdentity,
+  type MiaoshouUserIdentity,
+} from "@miaoshou/bridge";
+import { registerMiaoshouChatRoutes } from "@miaoshou/bridge/chat-stream";
 import { createHostCapabilityStore } from "./hostCapability.js";
 
 function wrapWebSocket(ws: WebSocket): ISocket {
@@ -87,12 +97,34 @@ function wrapWebSocket(ws: WebSocket): ISocket {
 const log = (...args: unknown[]) =>
   console.log(formatLogPrefix("zcode-server:http", process.pid), ...args);
 
+/** web-remote（/ws）默认只暴露两个会话通道（均经 miaoshou-bridge 身份包装）；
+ * project（readDirectory 任意路径 / readTree 泄露会话清单 / deleteProject 删数据）、
+ * broadcast（跨租户进程级广播与 claim）、terminal、file、credential 等一律不暴露。
+ * 本地开发想要完整上游功能时设 ZCODE_SERVER_WS_CHANNELS=*。 */
+const DEFAULT_WS_CHANNELS = [ServiceChannels.ZCodeAgent, ServiceChannels.ZCodeSession];
+
+function resolveWsChannelAllowlist(): Set<string> | undefined {
+  const raw = process.env.ZCODE_SERVER_WS_CHANNELS?.trim();
+  if (raw === "*") {
+    // 显式放开全量时记录一次告警，便于生产审计收口被解除的情况
+    log("ZCODE_SERVER_WS_CHANNELS=* 已放开 /ws 全量通道（仅限受控环境）");
+    return undefined;
+  }
+  if (!raw) return new Set(DEFAULT_WS_CHANNELS);
+  const channels = raw
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return new Set(channels.length > 0 ? channels : DEFAULT_WS_CHANNELS);
+}
+
 function setupChannelServer(
   ws: WebSocket,
   services: ServiceCollection,
   clientMode: "desktop-continuous" | "web-remote-replayable",
   workspaceIdentityMapper?: SourceServerWorkspaceIdentityMapper,
   resourcePeers?: TopicResourcePeers,
+  miaoshouIdentity?: MiaoshouUserIdentity,
 ) {
   const socket = wrapWebSocket(ws);
   const protocol = new SocketProtocol(socket);
@@ -117,7 +149,26 @@ function setupChannelServer(
     : undefined;
   const overrides = new Map<string, unknown>();
   if (connectionScope) {
-    overrides.set(IZCodeAgentService.channelName, connectionScope.service);
+    // 妙手桥接：/ws（web-remote）始终包装身份改写——网关注入的身份缺失时
+    // fail-closed 剥掉 quant 身份头（下游 401），客户端自带身份不得静默生效；
+    // zcode-session 与 zcode-agent 委托同一会话运行时，必须同样包装，
+    // 否则它成为绕过归属门禁与工具面收口的第二条通道；
+    // /ws/host（desktop-continuous 受信宿主）不包装，保留客户端自带 MCP 配置。
+    if (clientMode === "web-remote-replayable") {
+      overrides.set(
+        IZCodeAgentService.channelName,
+        wrapZCodeAgentServiceWithIdentity(connectionScope.service, miaoshouIdentity),
+      );
+      const sessionService = services.getOptional(IZCodeSessionService);
+      if (sessionService) {
+        overrides.set(
+          IZCodeSessionService.channelName,
+          wrapZCodeSessionServiceWithIdentity(sessionService, miaoshouIdentity),
+        );
+      }
+    } else {
+      overrides.set(IZCodeAgentService.channelName, connectionScope.service);
+    }
   }
   // Provisioning 携带跨 Environment 凭据，只允许 Desktop trusted host 使用；普通 Web
   // remote/replayable 客户端即使知道频道名，也不能获得 target 写入接口。
@@ -131,7 +182,16 @@ function setupChannelServer(
       },
     });
   }
-  services.exposeOnChannelServer(server, overrides);
+  // web-remote（/ws）通道白名单收口：服务集合里的 terminal（命令执行）、file（任意
+  // 文件读写）、credential（凭据读取）等高危服务不再暴露给共享令牌的多租户连接；
+  // 白名单可通过 ZCODE_SERVER_WS_CHANNELS 覆盖（逗号分隔通道名，"*" 恢复上游全量）。
+  // /ws/host（desktop-continuous 受信宿主）不受限，保留上游行为。
+  const wsChannelAllowlist = resolveWsChannelAllowlist();
+  const exposurePolicy =
+    clientMode === "web-remote-replayable" && wsChannelAllowlist
+      ? { allowedChannels: wsChannelAllowlist }
+      : undefined;
+  services.exposeOnChannelServer(server, overrides, exposurePolicy);
   socket.onClose(() => {
     peer?.dispose();
     reverseClient?.dispose();
@@ -262,6 +322,11 @@ function hasValidLiteToken(c: Context, token: string): boolean {
 }
 
 function isTokenProtectedPath(pathname: string): boolean {
+  // /api/agent/healthz 是部署探针（只暴露注册状态与可达性布尔值），放行免令牌
+  if (pathname === "/api/agent/healthz") return false;
+  // 其余 /api/agent/* 同样受 ZCODE_SERVER_AUTH_TOKEN 保护：网关代理时注入共享令牌
+  // （Authorization 被覆盖为服务令牌时，平台 JWT 由网关改经 X-Platform-Token 透传，
+  // 由 miaoshou-bridge 在业务层读取）。
   return pathname === "/ws" || pathname.startsWith("/ws/") || pathname.startsWith("/api/");
 }
 
@@ -370,16 +435,24 @@ export function createHttpServer(
   // 都不能再把自己提升为 trusted host。
   app.get(
     "/ws",
-    upgradeWebSocket(() => ({
-      onOpen(_event, ws) {
-        setupChannelServer(
-          ws.raw as WebSocket,
-          services,
-          "web-remote-replayable",
-          options.workspaceIdentityMapper,
-        );
-      },
-    })),
+    upgradeWebSocket((c) => {
+      // 与 /api/agent/* 同一信任判定：共享令牌缺失时不信任身份头、不注入身份
+      const miaoshouIdentity = identityTrustEnabled()
+        ? extractMiaoshouIdentity(c.req.raw.headers)
+        : undefined;
+      return {
+        onOpen(_event, ws) {
+          setupChannelServer(
+            ws.raw as WebSocket,
+            services,
+            "web-remote-replayable",
+            options.workspaceIdentityMapper,
+            undefined,
+            miaoshouIdentity,
+          );
+        },
+      };
+    }),
   );
 
   const upgradeTrustedHostWebSocket = upgradeWebSocket(() => ({
@@ -448,6 +521,9 @@ export function createHttpServer(
 
   app.post("/api/bots/:provider", handleBotCallback);
   app.post("/api/bots/:provider/:botId", handleBotCallback);
+
+  // 妙手平台业务兼容路由（/api/agent/chat 流式接口）
+  registerMiaoshouChatRoutes(app, services);
 
   // Bug 原因：旧 `/api/connect-remote` + `/ws/remote/:id` 会在 Server 内另起临时 stdio
   // runtime，绕过 R3 的 Window Host → Source Server attachment 主链；两个入口必须一起不可达。

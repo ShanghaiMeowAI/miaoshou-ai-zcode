@@ -24,6 +24,7 @@
     "@lydell/node-pty-darwin-x64": "1.2.0-beta.10",
     "@lydell/node-pty-linux-arm64": "1.2.0-beta.10",
     "@lydell/node-pty-linux-x64": "1.2.0-beta.10",
+    "@miaoshou/bridge": "workspace:*",
     "@zcode/client": "workspace:*",
     "@zcode/rpc": "workspace:*",
     "@zcode/services": "workspace:*",

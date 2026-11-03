@@ -76,6 +76,7 @@ export default defineConfig({
     "@zcode/services",
     "@zcode/services/node",
     "@zcode/client",
+    "@miaoshou/bridge",
   ],
   // ssh2 / node-pty 含 .node native addon，不能被 esbuild 处理。
   // undici / axios 这类 CJS 依赖被内联进 ESM bundle 后，运行时会走到

@@ -2,6 +2,13 @@ version: 1
 
 # 存量模块先标记为 legacy；新模块或完成迁移的模块设置 managed: true。
 modules:
+  - id: miaoshou-bridge
+    roots: [packages/miaoshou-bridge/src]
+    managed: true
+    requires: [services, shared, mcp-apps-protocol]
+    publicEntrypoints:
+      - packages/miaoshou-bridge/src/index.ts
+      - packages/miaoshou-bridge/src/chat-stream-route.ts
   - id: rpc
     roots: [packages/rpc/src]
     managed: false
@@ -1181,6 +1188,14 @@ global:
   acceptedUpstreamSnapshot: scripts/architecture/upstream-snapshot.json
 
 exceptions:
+  - id: miaoshou-chat-stream-route-size
+    rule: max-file-lines
+    paths: [packages/miaoshou-bridge/src/chat-stream-route.ts]
+    reason: SSE 流路由是桥接层的单一生命周期所有者（审批挂起、事件映射、回写收尾共享同一批闭包状态）；配置/审批/共享逻辑已拆至 chat-registration、approval-routes、chat-shared，继续机械拆分只会把状态机摊到多个文件并增加回归面。
+  - id: miaoshou-bridge-vitest-config
+    rule: unmanaged-new-file
+    paths: [packages/miaoshou-bridge/vitest.config.ts]
+    reason: 该文件只装配测试项目，保持根单测入口可运行；不包含桥接运行逻辑。实现文件已由 modules 中的 miaoshou-bridge 登记管理。
   - id: session-features-attribution-header-edit
     rule: unmanaged-new-file
     paths: [apps/zcode-cli/packages/adapters/src/model/runner-attribution.ts]

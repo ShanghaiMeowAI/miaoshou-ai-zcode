@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  bridge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - run: corepack enable
+
+      - name: Install (filtered)
+        run: >
+          pnpm install --filter @zcode/server --filter @zcode/shared
+          --filter @zcode/services --filter @miaoshou/bridge
+
+      - name: Typecheck bridge
+        run: pnpm --filter @miaoshou/bridge run typecheck
+
+      - name: Test bridge
+        run: pnpm --filter @miaoshou/bridge test
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: bridge
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.MIAOSHOU_HOST }}
+          username: ${{ secrets.MIAOSHOU_USER }}
+          key: ${{ secrets.MIAOSHOU_SSH_KEY }}
+          port: 22
+          timeout: 30s
+          command_timeout: 15m
+          script_stop: true
+          script: |
+            if [ ! -d /var/www/miaoshou-ai-zcode ]; then
+              echo "首次部署：克隆仓库"
+              git clone git@github.com:ShanghaiMeowAI/miaoshou-ai-zcode.git /var/www/miaoshou-ai-zcode
+            fi
+            cd /var/www/miaoshou-ai-zcode
+            git fetch --all
+            git reset --hard origin/main
+            chmod +x scripts/deploy-miaoshou.sh
+            bash scripts/deploy-miaoshou.sh
