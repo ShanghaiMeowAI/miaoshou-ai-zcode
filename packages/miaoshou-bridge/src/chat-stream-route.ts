@@ -400,17 +400,6 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
             options: payload.options,
             allowCustom: false,
           });
-          // 挂起工具的卡片补占位结果:api-agent 查询端按"result 非空"回显
-          // tool_call 卡片,无占位会让审批中的卡片刷新后消失;批准/拒绝后
-          // 下一轮落的助手消息携带真实结果卡片
-          if (permission.toolCallId) {
-            recordedBlocks.push({
-              type: "tool_call",
-              id: permission.toolCallId,
-              name: eventToolName(permission.toolName),
-              result: "等待用户审批，尚未执行。",
-            });
-          }
           writeEvent(interruptPayload, false);
           // done 同样延后到回写落库之后：interrupt 卡片已记入 blocks，
           // 提前发 done 会让前端的重拉拿不到审批卡片

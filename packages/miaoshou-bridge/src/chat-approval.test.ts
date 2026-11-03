@@ -8,7 +8,7 @@ beforeAll(() => {
 });
 
 describe("registerMiaoshouChatRoutes 审批与回放", () => {
-  it("完整审批轮集成：result 补发的工具卡片随 blocks 落库", async () => {
+  it("量化工具完全授权：permission 直接自动批准，工具卡片随 blocks 落库", async () => {
     await withEnv({ ZCODE_SERVER_AUTH_TOKEN: "t", QUANT_MCP_INTERNAL_SECRET: "s" }, async () => {
       const { pendingPermissions, conversationSessionMap } = await import("./chat-shared.js");
       pendingPermissions.clear();
@@ -24,8 +24,8 @@ describe("registerMiaoshouChatRoutes 审批与回放", () => {
         body?: Record<string, unknown>;
       }> = [];
       vi.stubGlobal("fetch", stubBridgeFetch(fetchCalls));
-      // 生产时序复刻：session.event 包装 + eventId；runtime 只投 result
-      // 不投 scheduled；permission.requested 到达后挂起并终态化本流
+      // 生产时序复刻：runtime 只投 result 不投 scheduled；量化工具的
+      // permission.requested 到达后自动批准（不再挂起等用户回执）
       const seqServices = {
         get: () => ({
           onDynamicSessionEvent:
@@ -56,28 +56,22 @@ describe("registerMiaoshouChatRoutes 审批与回放", () => {
                 cb({
                   type: "session.event",
                   event: {
-                    type: "part.delta",
-                    eventId: "evt-888-td",
-                    payload: { field: "text", delta: "策略已确认" },
-                  },
-                });
-                cb({
-                  type: "session.event",
-                  event: {
                     type: "permission.requested",
                     eventId: "evt-888-perm",
                     payload: {
                       requestId: "perm_888",
                       toolName: "backtest_run",
                       toolCallId: "call_888_bt",
-                      options: [
-                        {
-                          optionId: "a1",
-                          kind: "allow_once",
-                          name: "允许",
-                        },
-                      ],
+                      options: [{ optionId: "a1", kind: "allow_once", name: "允许" }],
                     },
+                  },
+                });
+                cb({
+                  type: "session.event",
+                  event: {
+                    type: "turn.completed",
+                    eventId: "evt-888-done",
+                    payload: { resultType: "success", response: "ok" },
                   },
                 });
               });
@@ -108,7 +102,10 @@ describe("registerMiaoshouChatRoutes 审批与回放", () => {
           }),
         });
         const text = await response.text();
-        expect(text).toContain('"type":"interrupt"');
+        // 完全授权：不弹审批卡片，直接自动批准，流正常收尾
+        expect(text).not.toContain('"type":"interrupt"');
+        expect(text).toContain('"type":"done"');
+        expect(pendingPermissions.size).toBe(0);
         const messageCalls = fetchCalls.filter((call) =>
           call.url.includes("/internal/bridge/messages"),
         );
@@ -116,7 +113,6 @@ describe("registerMiaoshouChatRoutes 审批与回放", () => {
         const serialized = JSON.stringify(assistantCall?.body ?? {});
         expect(serialized).toContain("call_888");
         expect(serialized).toContain("策略详情");
-        expect(serialized).toContain('"interrupt"');
       } finally {
         vi.unstubAllGlobals();
         pendingPermissions.clear();
@@ -124,7 +120,6 @@ describe("registerMiaoshouChatRoutes 审批与回放", () => {
       }
     });
   });
-
   it("拒绝回执后为挂起工具补 tool_result 终态", async () => {
     await withEnv({ ZCODE_SERVER_AUTH_TOKEN: "t", QUANT_MCP_INTERNAL_SECRET: "s" }, async () => {
       const { pendingPermissions, conversationSessionMap } = await import("./chat-shared.js");
@@ -203,7 +198,7 @@ describe("registerMiaoshouChatRoutes 审批与回放", () => {
     });
   });
 
-  it("回放的历史事件按 eventId 去重，不再重复挂起审批或提前收尾", async () => {
+  it("回放的历史事件按 eventId 去重：自动批准的回执只发一次", async () => {
     await withEnv({ ZCODE_SERVER_AUTH_TOKEN: "t", QUANT_MCP_INTERNAL_SECRET: "s" }, async () => {
       const { pendingPermissions, conversationSessionMap } = await import("./chat-shared.js");
       pendingPermissions.clear();
@@ -213,18 +208,16 @@ describe("registerMiaoshouChatRoutes 审批与回放", () => {
         sessionId: "sess_x",
         lastUsedAt: Date.now(),
       });
-      const listeners: Array<(event: unknown) => void> = [];
       let subscribeCount = 0;
+      const commandCalls: number[] = [];
       const replayServices = {
         get: () => ({
           onDynamicSessionEvent:
             () =>
             (cb: (event: unknown) => void): { dispose: () => void } => {
-              listeners.push(cb);
-              // 模拟 runtime 回放：上一轮的审批请求（eventId 固定，两条流重复）
-              // 与本轮终态（eventId 每轮唯一）
               const round = ++subscribeCount;
               queueMicrotask(() => {
+                // 模拟 runtime 回放：上一轮的审批请求(eventId 固定,两条流重复)
                 cb({
                   type: "session.event",
                   event: {
@@ -238,6 +231,7 @@ describe("registerMiaoshouChatRoutes 审批与回放", () => {
                     },
                   },
                 });
+                // 本轮终态(eventId 每轮唯一)
                 cb({
                   type: "session.event",
                   event: {
@@ -249,7 +243,10 @@ describe("registerMiaoshouChatRoutes 审批与回放", () => {
               });
               return { dispose: () => {} };
             },
-          sendConversationCommandV4: async () => ({ status: "accepted" }),
+          sendConversationCommandV4: async () => {
+            commandCalls.push(subscribeCount);
+            return { status: "accepted" };
+          },
           closeSession: async () => true,
           createSession: async () => ({ session: { sessionId: "sess_x" } }),
           sendPrompt: async () => ({ ok: true }),
@@ -258,49 +255,38 @@ describe("registerMiaoshouChatRoutes 审批与回放", () => {
       } as unknown as Parameters<typeof registerMiaoshouChatRoutes>[1];
       const app = new Hono();
       registerMiaoshouChatRoutes(app, replayServices);
-      try {
-        // 第一条流：回放事件被当作新事件处理（登记 eventId、挂起审批）
-        const first = await app.request("/api/agent/chat", {
+      const baseHeaders = {
+        "content-type": "application/json",
+        "x-platform-token": "t",
+        "x-user-id": "42",
+        "x-user-role": "user",
+      };
+      const makeChat = (message: string, runId: string) =>
+        app.request("/api/agent/chat", {
           method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-platform-token": "t",
-            "x-user-id": "42",
-            "x-user-role": "user",
-          },
+          headers: baseHeaders,
           body: JSON.stringify({
             conversation_id: "conv-replay",
-            message: "跑回测",
-            run_id: "run-replay-1",
+            message,
+            run_id: runId,
           }),
         });
-        const firstText = await first.text();
-        expect(firstText).toContain('"type":"interrupt"');
-        expect(pendingPermissions.has("perm_replay_1")).toBe(true);
-        pendingPermissions.clear();
-        // 第二条流：同一审批事件再次到达（回放）→ 去重闸挡住，不再挂起
-        const second = await app.request("/api/agent/chat", {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-platform-token": "t",
-            "x-user-id": "42",
-            "x-user-role": "user",
-          },
-          body: JSON.stringify({
-            conversation_id: "conv-replay",
-            message: "继续",
-            run_id: "run-replay-2",
-          }),
-        });
-        const text = await second.text();
-        expect(text).not.toContain('"type":"interrupt"');
-        expect(text).not.toContain('"interrupted":true');
-        expect(text).toContain('"type":"done"');
-      } finally {
-        pendingPermissions.clear();
-        conversationSessionMap.clear();
-      }
+      // 第一条流：回放的审批请求被当作新事件处理 → 自动批准(resolve ×1)
+      const first = await makeChat("跑回测", "run-replay-1");
+      const firstText = await first.text();
+      expect(firstText).not.toContain('"type":"interrupt"');
+      expect(firstText).toContain('"type":"done"');
+      expect(commandCalls).toEqual([1]);
+      pendingPermissions.clear();
+      // 第二条流：同一审批事件再次到达(回放)→ 去重闸挡住,不再重复批准
+      const second = await makeChat("继续", "run-replay-2");
+      const secondText = await second.text();
+      expect(secondText).not.toContain('"type":"interrupt"');
+      expect(secondText).toContain('"type":"done"');
+      // 第二条流的终态之外没有新的 resolveInteraction 调用
+      expect(commandCalls.filter((round) => round === 2)).toEqual([]);
+      pendingPermissions.clear();
+      conversationSessionMap.clear();
     });
   });
 

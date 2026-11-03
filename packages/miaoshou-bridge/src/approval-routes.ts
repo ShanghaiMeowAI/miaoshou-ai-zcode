@@ -114,10 +114,12 @@ export function buildPendingPermission(params: {
   if (typeof params.request.toolCallId === "string" && params.request.toolCallId) {
     permission.toolCallId = params.request.toolCallId;
   }
+  // 妙手量化平台不是交互式编程 harness:回测/保存等量化操作由 AI 直接执行,
+  // 不需要用户逐次批准(产品决策:完全授权)。未知的非量化工具仍一律拒绝。
   const disposition: PermissionDisposition = QUANT_READONLY_TOOLS.has(toolName)
     ? "auto_approve"
     : QUANT_MUTATION_TOOLS.has(toolName)
-      ? "pending"
+      ? "auto_approve"
       : "reject";
   return { permission, disposition, toolName };
 }

@@ -17,6 +17,50 @@ export interface StreamAccumulator {
   queuedDeltaBytes: number;
 }
 
+/** 回测类工具(与前端 agent-tool-outcome 的 BACKTEST_TOOLS 同一口径)。 */
+const BACKTEST_TOOL_NAMES = new Set([
+  "create_strategy_backtest",
+  "create_backtest_run",
+  "run_backtest",
+]);
+
+function isBacktestToolName(toolName: string): boolean {
+  return BACKTEST_TOOL_NAMES.has(toolName);
+}
+
+/** 从回测工具结果文本提取 run_id(与前端证据判定同口径)。 */
+function extractBacktestRunId(text: string): number | undefined {
+  const match = /\brun_id["']?\s*[:：]\s*["']?(\d+)/.exec(text);
+  const runId = match ? Number(match[1]) : NaN;
+  return Number.isInteger(runId) && runId > 0 ? runId : undefined;
+}
+
+function extractStrategyId(text: string): number | undefined {
+  const match = /\bstrategy_id["']?\s*[:：]\s*["']?(\d+)/.exec(text);
+  const strategyId = match ? Number(match[1]) : NaN;
+  return Number.isInteger(strategyId) && strategyId > 0 ? strategyId : undefined;
+}
+
+/** 旧链路的 artifact 结构,前端 normalizeBacktestArtifact 渲染为可点击详情。 */
+function backtestArtifactFromResult(
+  toolCallId: string,
+  resultText: string,
+): Record<string, unknown> | undefined {
+  const runId = extractBacktestRunId(resultText);
+  if (runId === undefined) return undefined;
+  const artifact: Record<string, unknown> = {
+    type: "artifact",
+    artifact_type: "backtest_run",
+    run_id: runId,
+    url: `/strategy/backtest-runs/${runId}`,
+    title: `回测详情 #${runId}`,
+    toolCallId,
+  };
+  const strategyId = extractStrategyId(resultText);
+  if (strategyId !== undefined) artifact.strategy_id = strategyId;
+  return artifact;
+}
+
 /** 处理单个 session.event。返回 true 表示事件已被本函数消费。 */
 export function handleSessionEvent(params: {
   event: { type: string; payload?: Record<string, unknown> };
@@ -157,6 +201,17 @@ export function handleSessionEvent(params: {
         if (blk && blk.type === "tool_call" && blk.id === toolPayload.toolCallId) {
           blk.result = trPayload.content;
           break;
+        }
+      }
+      // 回测类工具完成后从结果提取 run_id,落一个可点击的回测详情卡片
+      // (与旧链路的 artifact 结构一致,前端渲染为右侧详情入口)
+      if (isBacktestToolName(toolName) && toolPayload.toolCallId && trPayload.ok !== false) {
+        const artifact = backtestArtifactFromResult(toolPayload.toolCallId, trPayload.content);
+        const alreadyRecorded = params.recordedBlocks.some(
+          (b) => b.type === "artifact" && b.toolCallId === toolPayload.toolCallId,
+        );
+        if (artifact && !alreadyRecorded) {
+          params.recordedBlocks.push(artifact);
         }
       }
       params.writeEvent(trPayload, false);
