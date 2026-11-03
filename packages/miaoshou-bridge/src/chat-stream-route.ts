@@ -417,6 +417,10 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
         const disposable = subscription(
           (serviceEvent: { type?: string } & Record<string, unknown>) => {
             try {
+              // 临时诊断日志：定位生产事件形态后删除
+              console.error(
+                `[miaoshou-bridge][diag] type=${serviceEvent.type} inner=${(serviceEvent.event as any)?.type ?? "-"} eventId=${String((serviceEvent.event as any)?.eventId ?? "-").slice(0, 16)}`,
+              );
               // 回放去重闸（必须在一切处理之前）：resume/重连流的订阅会收到
               // 历史事件回放，上一轮已处理的审批、工具卡片、文本与终态一律
               // 不再处理，否则审批卡片复活、工具卡片与文本重复下发

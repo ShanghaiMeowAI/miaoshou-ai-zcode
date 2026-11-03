@@ -103,6 +103,130 @@ describe("registerMiaoshouChatRoutes 注册守卫", () => {
     });
   });
 
+  it("完整审批轮集成：result 补发的工具卡片随 blocks 落库", async () => {
+    await withEnv(
+      { ZCODE_SERVER_AUTH_TOKEN: "t", QUANT_MCP_INTERNAL_SECRET: "s" },
+      async () => {
+        const { pendingPermissions, conversationSessionMap } = await import(
+          "./chat-shared.js"
+        );
+        pendingPermissions.clear();
+        conversationSessionMap.clear();
+        conversationSessionMap.set("42:t888", {
+          userId: "42",
+          sessionId: "sess_x",
+          lastUsedAt: Date.now(),
+          conversationId: 888,
+        });
+        const fetchCalls: Array<{
+          url: string;
+          body?: Record<string, unknown>;
+        }> = [];
+        vi.stubGlobal("fetch", stubBridgeFetch(fetchCalls));
+        // 生产时序复刻：session.event 包装 + eventId；runtime 只投 result
+        // 不投 scheduled；permission.requested 到达后挂起并终态化本流
+        const seqServices = {
+          get: () => ({
+            onDynamicSessionEvent:
+              () =>
+              (cb: (event: unknown) => void): { dispose: () => void } => {
+                queueMicrotask(() => {
+                  cb({
+                    type: "session.event",
+                    event: {
+                      type: "turn.started",
+                      eventId: "evt-888-ts",
+                      payload: { foregroundExecutionId: "exec-888" },
+                    },
+                  });
+                  cb({
+                    type: "session.event",
+                    event: {
+                      type: "tool.updated",
+                      eventId: "evt-888-tr",
+                      payload: {
+                        kind: "result",
+                        toolCallId: "call_888",
+                        toolName: "get_strategy_detail",
+                        result: { content: [{ text: "策略详情" }] },
+                      },
+                    },
+                  });
+                  cb({
+                    type: "session.event",
+                    event: {
+                      type: "part.delta",
+                      eventId: "evt-888-td",
+                      payload: { field: "text", delta: "策略已确认" },
+                    },
+                  });
+                  cb({
+                    type: "session.event",
+                    event: {
+                      type: "permission.requested",
+                      eventId: "evt-888-perm",
+                      payload: {
+                        requestId: "perm_888",
+                        toolName: "backtest_run",
+                        toolCallId: "call_888_bt",
+                        options: [
+                          {
+                            optionId: "a1",
+                            kind: "allow_once",
+                            name: "允许",
+                          },
+                        ],
+                      },
+                    },
+                  });
+                });
+                return { dispose: () => {} };
+              },
+            sendConversationCommandV4: async () => ({ status: "accepted" }),
+            closeSession: async () => true,
+            createSession: async () => ({ session: { sessionId: "sess_x" } }),
+            sendPrompt: async () => ({ ok: true }),
+          }),
+          getOptional: () => undefined,
+        } as unknown as Parameters<typeof registerMiaoshouChatRoutes>[1];
+        try {
+          const app = new Hono();
+          registerMiaoshouChatRoutes(app, seqServices);
+          const response = await app.request("/api/agent/chat", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-platform-token": "t",
+              "x-user-id": "42",
+              "x-user-role": "user",
+            },
+            body: JSON.stringify({
+              conversation_id: 888,
+              message: "跑回测",
+              run_id: "run-888",
+            }),
+          });
+          const text = await response.text();
+          expect(text).toContain('"type":"interrupt"');
+          const messageCalls = fetchCalls.filter((call) =>
+            call.url.includes("/internal/bridge/messages"),
+          );
+          const assistantCall = messageCalls.find(
+            (call) => call.body?.role === "assistant",
+          );
+          const serialized = JSON.stringify(assistantCall?.body ?? {});
+          expect(serialized).toContain("call_888");
+          expect(serialized).toContain("策略详情");
+          expect(serialized).toContain('"interrupt"');
+        } finally {
+          vi.unstubAllGlobals();
+          pendingPermissions.clear();
+          conversationSessionMap.clear();
+        }
+      },
+    );
+  });
+
   it("配置齐全时注册并要求身份", async () => {
     await withEnv({ ZCODE_SERVER_AUTH_TOKEN: "t", QUANT_MCP_INTERNAL_SECRET: "s" }, async () => {
       const app = new Hono();
