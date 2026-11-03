@@ -26,7 +26,7 @@ export function registerHealthz(
     reachable: boolean;
     inFlight: Promise<boolean> | null;
   } = { at: 0, reachable: false, inFlight: null };
-  app.get("/api/agent/healthz", async (c) => {
+  const handleHealthz = async (c: any) => {
     if (!registrationState.registered) {
       return c.json(
         {
@@ -72,5 +72,7 @@ export function registerHealthz(
       },
       200,
     );
-  });
+  };
+  app.get("/api/agent/healthz", handleHealthz);
+  app.get("/agent/api/agent/healthz", handleHealthz);
 }

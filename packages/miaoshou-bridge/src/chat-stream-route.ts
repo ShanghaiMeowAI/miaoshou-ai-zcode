@@ -130,7 +130,8 @@ export function registerMiaoshouChatRoutes(
     );
 
   // ── 核心流式对话接口：POST /api/agent/chat ─────────────────────────────
-  app.post("/api/agent/chat", async (c) => {
+  // 兼顾带 /agent 网关前缀（前端实际请求基地址）与不带前缀两种路径
+  const handleChat = async (c: any) => {
     // 平台惯例：Kong jwt-auth 验签并注入 X-User-ID，Bridge 信任网关身份头
     const identity = extractMiaoshouIdentity(c.req.raw.headers);
     if (!identity) {
@@ -833,7 +834,10 @@ export function registerMiaoshouChatRoutes(
         releaseStreamSlot();
       }
     });
-  });
+  };
+
+  app.post("/api/agent/chat", handleChat);
+  app.post("/agent/api/agent/chat", handleChat);
 
   registerApprovalRoutes(app, { workspacePath, rawAgentService });
 }

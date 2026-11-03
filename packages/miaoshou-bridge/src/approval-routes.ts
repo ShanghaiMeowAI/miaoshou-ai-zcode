@@ -211,7 +211,7 @@ export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
   const sweepExpiredPending = () => sweepExpiredPendingWith(deps);
 
   // ── 审批回执：POST /api/agent/interrupts/:interruptId ──────────────────
-  app.post("/api/agent/interrupts/:interruptId", async (c) => {
+  const handleInterrupt = async (c: any) => {
     const identity = extractMiaoshouIdentity(c.req.raw.headers);
     if (!identity) return c.json({ detail: "未登录" }, 401);
     sweepExpiredPending();
@@ -271,10 +271,12 @@ export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
       success: true,
       note: "批准已提交；执行结果请回到会话流查看",
     });
-  });
+  };
+  app.post("/api/agent/interrupts/:interruptId", handleInterrupt);
+  app.post("/agent/api/agent/interrupts/:interruptId", handleInterrupt);
 
   // ── 取消执行：POST /api/agent/runs/:runId/cancel ──────────────────────
-  app.post("/api/agent/runs/:runId/cancel", async (c) => {
+  const handleCancel = async (c: any) => {
     const identity = extractMiaoshouIdentity(c.req.raw.headers);
     if (!identity) return c.json({ detail: "未登录" }, 401);
     const cancelKey = `${identity.userId}:${c.req.param("runId")}`;
@@ -305,13 +307,23 @@ export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
         500,
       );
     }
-  });
+  };
+  app.post("/api/agent/runs/:runId/cancel", handleCancel);
+  app.post("/agent/api/agent/runs/:runId/cancel", handleCancel);
 
   // ── 状态记录（旧前端契约保留）：POST /api/agent/conversations/:id/runs/:runId/interrupted
-  app.post("/api/agent/conversations/:id/runs/:runId/interrupted", (c) => {
+  const handleInterrupted = (c: any) => {
     return c.json({
       success: true,
       note: "状态已记录；停止执行请调用 cancel 接口",
     });
-  });
+  };
+  app.post(
+    "/api/agent/conversations/:id/runs/:runId/interrupted",
+    handleInterrupted,
+  );
+  app.post(
+    "/agent/api/agent/conversations/:id/runs/:runId/interrupted",
+    handleInterrupted,
+  );
 }
