@@ -25,7 +25,13 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Typecheck bridge
-        run: pnpm --filter @miaoshou/bridge run typecheck
+        # 依赖链先按各自 composite 工程构建声明产物:干净检出没有 rpc/services
+        # 的 dist,tsc 会回退解析依赖源码并被 bridge 的严格选项放大成一堆
+        # 依赖方错误(上游设计即"消费方先 tsc -b 复用声明产物",见 rpc tsconfig 注释)
+        run: |
+          pnpm --filter @zcode/rpc exec tsc -b tsconfig.json
+          pnpm --filter @zcode/services exec tsc -b tsconfig.json
+          pnpm --filter @miaoshou/bridge run typecheck
 
       - name: Test bridge
         run: pnpm --filter @miaoshou/bridge test
