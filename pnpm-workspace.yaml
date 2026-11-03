@@ -4,19 +4,16 @@ packages:
   - apps/zcode-cli
   - apps/zcode-cli/packages/*
   - apps/zcode-cli/tools/*
+# 妙手部署只跑 linux-x64 服务器与 mac 开发机：各机器只装当前平台的
+# 原生二进制。上游声明为全平台（桌面版发多平台产物），全平台安装曾把
+# 生产磁盘打满（node_modules 近半是 android/freebsd/s390x/win32 废物）
 supportedArchitectures:
   os:
     - current
-    - darwin
-    - linux
-    - win32
   cpu:
     - current
-    - x64
-    - arm64
   libc:
     - current
-    - glibc
 allowBuilds:
   cpu-features: true
   edgedriver: true
