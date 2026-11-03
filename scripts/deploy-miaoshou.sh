@@ -19,11 +19,13 @@ set +a
 
 # 端口预检：3030 被其它进程占用时提前失败。本仓库自身的 node 进程
 # （正常部署时旧实例仍监听,startOrReload 会原位替换）不算占用——
-# ss 显示的进程名形如 "node /var/www/m...",按仓库路径匹配而非 pm2 名。
+# ss 显示的进程名被截断为 "node /var/www/m",无法按名字匹配,
+# 改用 pm2 进程 pid 精确对比。
 ZCODE_PORT="${ZCODE_PORT:-3030}"
 if command -v ss >/dev/null 2>&1; then
   OCCUPIED="$(ss -ltnp 2>/dev/null | grep -E ":${ZCODE_PORT}\b" || true)"
-  if [ -n "${OCCUPIED}" ] && ! printf '%s' "${OCCUPIED}" | grep -q "node /var/www/miaoshou"; then
+  PM2_PID="$(pm2 pid miaoshou-ai-zcode 2>/dev/null || true)"
+  if [ -n "${OCCUPIED}" ] && [ -n "${PM2_PID}" ] && ! printf '%s' "${OCCUPIED}" | grep -q "pid=${PM2_PID},"; then
     echo "端口 ${ZCODE_PORT} 已被其它进程占用：" >&2
     echo "${OCCUPIED}" >&2
     exit 1
