@@ -331,6 +331,57 @@ describe("registerMiaoshouChatRoutes 审批与回放", () => {
     });
   });
 
+  it("回测工具成功后落可点击的回测详情 artifact 卡片", async () => {
+    await withEnv({ ZCODE_SERVER_AUTH_TOKEN: "t", QUANT_MCP_INTERNAL_SECRET: "s" }, async () => {
+      const recorded: Array<Record<string, unknown>> = [];
+      const { handleSessionEvent } = await import("./chat-stream-events.js");
+      const makeEvent = (callId: string, content: string) => ({
+        event: {
+          type: "tool.updated",
+          payload: {
+            kind: "result",
+            toolCallId: callId,
+            toolName: "backtest_run",
+            result: { content: [{ text: content }] },
+          },
+        },
+        accumulator: {
+          assistantText: "",
+          truncated: false,
+          stickyTruncated: false,
+          queuedDeltaBytes: 0,
+        },
+        runId: "run-artifact",
+        recordedBlocks: recorded,
+        emittedToolCalls: new Set<string>(),
+        registeredToolNames: new Map(),
+        writeEvent: () => {},
+      });
+      // runtime 新名 backtest_run + 结果含 run_id/strategy_id
+      handleSessionEvent(
+        makeEvent(
+          "call_bt_1",
+          '{"ok":true,"status":"success","run_id":10506,"strategy_id":330}',
+        ) as never,
+      );
+      const artifact = recorded.find((block) => block.type === "artifact");
+      expect(artifact).toBeTruthy();
+      expect(artifact?.run_id).toBe(10506);
+      expect(artifact?.strategy_id).toBe(330);
+      expect(artifact?.url).toBe("/strategy/backtest-runs/10506");
+      expect(artifact?.title).toBe("回测详情 #10506");
+      // 失败结果不生成 artifact
+      recorded.length = 0;
+      handleSessionEvent(
+        makeEvent(
+          "call_bt_2",
+          '{"ok":false,"status":"VALIDATION_FAILED","message":"结束日期不合法"}',
+        ) as never,
+      );
+      expect(recorded.some((block) => block.type === "artifact")).toBe(false);
+    });
+  });
+
   it("审批挂起时输入文本 → 隐式取消审批并降级为普通对话", async () => {
     await withEnv({ ZCODE_SERVER_AUTH_TOKEN: "t", QUANT_MCP_INTERNAL_SECRET: "s" }, async () => {
       const { pendingPermissions, conversationSessionMap } = await import("./chat-shared.js");

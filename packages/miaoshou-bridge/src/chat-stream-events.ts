@@ -17,11 +17,13 @@ export interface StreamAccumulator {
   queuedDeltaBytes: number;
 }
 
-/** 回测类工具(与前端 agent-tool-outcome 的 BACKTEST_TOOLS 同一口径)。 */
+/** 回测类工具：runtime 发新名(如 backtest_run)，前端词汇表用旧名
+ *  (create_strategy_backtest)。两套名字都要认，否则 artifact 不生成。 */
 const BACKTEST_TOOL_NAMES = new Set([
   "create_strategy_backtest",
   "create_backtest_run",
   "run_backtest",
+  "backtest_run",
 ]);
 
 function isBacktestToolName(toolName: string): boolean {
