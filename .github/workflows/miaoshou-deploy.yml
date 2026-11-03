@@ -22,7 +22,8 @@ jobs:
       - name: Install (filtered)
         run: >
           pnpm install --filter @zcode/server --filter @zcode/shared
-          --filter @zcode/services --filter @miaoshou/bridge
+          --filter @zcode/services --filter @zcode/provider
+          --filter @zcode/provider-node --filter @miaoshou/bridge
 
       - name: Typecheck bridge
         run: pnpm --filter @miaoshou/bridge run typecheck

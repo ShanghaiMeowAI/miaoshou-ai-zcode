@@ -29,9 +29,9 @@ if command -v ss >/dev/null 2>&1; then
 fi
 
 corepack enable
-pnpm install --filter @zcode/server --filter @zcode/shared --filter @zcode/services --filter @miaoshou/bridge
-pnpm --filter @zcode/shared run build
-pnpm --filter @zcode/services run build
+# provider/provider-node 必须显式加入：server 构建期加载 provider-node 源码做
+# 内置 provider 配置校验，pnpm 过滤安装不会为 services 的 workspace 依赖建链接
+pnpm install --filter @zcode/server --filter @zcode/shared --filter @zcode/services --filter @zcode/provider --filter @zcode/provider-node --filter @miaoshou/bridge
 pnpm --filter @zcode/server run build
 
 mkdir -p workspace

@@ -95,7 +95,11 @@ if not uid then
 end
 kong.service.request.set_header("X-User-ID", tostring(uid))
 kong.service.request.set_header("X-User-Role", "user")
-kong.service.request.set_header("X-Platform-Token", token)'
+-- ZCode Server 校验 Authorization 必须是共享服务令牌；bridge 的身份信任
+-- 判定要求 X-Platform-Token 等于同一令牌。两个占位符都用实际值替换
+-- （服务器上执行: grep ^ZCODE_SERVER_AUTH_TOKEN= /var/www/miaoshou-ai-zcode/.env.production）
+kong.service.request.set_header("X-Platform-Token", "<ZCODE_SERVER_AUTH_TOKEN>")
+kong.service.request.set_header("Authorization", "Bearer <ZCODE_SERVER_AUTH_TOKEN>")'
 ```
 
 ### 3. Route（先灰度后全量）
