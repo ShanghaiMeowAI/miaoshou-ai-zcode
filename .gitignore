@@ -75,3 +75,6 @@ packages/desktop/resources/macos-window-bounds/
 __pycache__/
 *.pyc
 .zcode-runtime
+
+# 生产环境配置绝不入库:上游曾误提交示例文件,git reset 会覆盖服务器真实配置
+.env.production
