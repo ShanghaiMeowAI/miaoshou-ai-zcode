@@ -5,6 +5,28 @@
 set -e
 cd /var/www/miaoshou-ai-zcode
 
+# CI 经 SSH 调用时是非交互式 shell，不会加载 nvm/.bashrc，
+# PATH 里没有 node/corepack。先按 nvm 的位置补齐。
+if ! command -v corepack >/dev/null 2>&1; then
+  export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+  if [ -s "$NVM_DIR/nvm.sh" ]; then
+    . "$NVM_DIR/nvm.sh" >/dev/null 2>&1
+  fi
+  if ! command -v corepack >/dev/null 2>&1; then
+    for node_bin in "$NVM_DIR"/versions/node/*/bin "$HOME"/.volta/bin /usr/local/bin; do
+      if [ -x "$node_bin/corepack" ]; then
+        PATH="$node_bin:$PATH"
+        export PATH
+        break
+      fi
+    done
+  fi
+fi
+if ! command -v corepack >/dev/null 2>&1; then
+  echo "找不到 corepack/node（CI 非交互式 shell 的 PATH 问题），请检查服务器的 nvm 安装" >&2
+  exit 1
+fi
+
 ENV_FILE=.env.production
 if [ ! -f "${ENV_FILE}" ]; then
   echo "缺少 ${ENV_FILE}（含 ZCODE_SERVER_AUTH_TOKEN 等生产配置），拒绝部署" >&2
