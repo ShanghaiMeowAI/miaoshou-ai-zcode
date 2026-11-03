@@ -1732,6 +1732,12 @@ const zcodeToolCallBasePayloadSchema = z
     childSessionId: nonEmptyString.optional(),
     childToolCallId: nonEmptyString.optional(),
     description: z.string().optional(),
+    // 修复：CLI 已携带工具展示与副作用元数据（display/readOnly/sideEffectScope）；
+    // strict schema 漏字段会让 session/event 整条被丢弃（bridge 收不到工具卡片，
+    // 审批与回放链路错乱）。bridge 不消费这些字段，仅放行。
+    display: z.unknown().optional(),
+    readOnly: z.unknown().optional(),
+    sideEffectScope: z.unknown().optional(),
   })
   .strict();
 
@@ -1813,6 +1819,8 @@ export const zcodePermissionRequestedEventPayloadSchema = z
     options: z.array(zcodePermissionOptionSchema).min(1),
     childSessionId: nonEmptyString.optional(),
     background: z.boolean().optional(),
+    // 修复：CLI 已携带全量授权标记；strict schema 漏字段会让事件整条被丢弃。
+    fullAccessSupported: z.unknown().optional(),
   })
   .strict();
 export const zcodePermissionResolvedEventPayloadSchema = z
