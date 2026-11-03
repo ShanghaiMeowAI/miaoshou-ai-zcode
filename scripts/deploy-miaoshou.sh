@@ -37,7 +37,7 @@ pnpm --filter @zcode/server run build
 mkdir -p workspace
 # 环境经 --update-env 继承本 shell（.env.production 已 export），
 # ecosystem 文件里不落生产密钥
-pm2 startOrReload ecosystem.miaoshou.config.js --update-env
+pm2 startOrReload ecosystem.miaoshou.config.cjs --update-env
 
 # 探针：bridge 必须已注册且 quant 可达（readiness ready）才算发布成功
 for _ in $(seq 1 30); do
