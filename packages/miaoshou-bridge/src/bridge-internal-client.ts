@@ -114,7 +114,11 @@ export async function lookupBridgeConversation(
 /** 轮次结束把对话落进消息表；失败返回 false（调用方只记日志）。 */
 export async function appendBridgeMessages(
   conversationId: number,
-  messages: Array<{ role: "user" | "assistant"; content: string }>,
+  messages: Array<{
+    role: "user" | "assistant";
+    content: string;
+    extra?: Record<string, unknown>;
+  }>,
 ): Promise<boolean> {
   let allOk = true;
   for (const message of messages) {
@@ -122,6 +126,7 @@ export async function appendBridgeMessages(
       conversation_id: conversationId,
       role: message.role,
       content: message.content,
+      ...(message.extra ? { extra: message.extra } : {}),
     });
     if (result === undefined) allOk = false;
   }

@@ -542,7 +542,7 @@ describe("registerMiaoshouChatRoutes 注册守卫", () => {
     );
   });
 
-  it("replace_last_turn 显式拒绝而不是静默追加", async () => {
+  it("replace_last_turn 平滑放行以支持界面重试", async () => {
     await withEnv(
       { ZCODE_SERVER_AUTH_TOKEN: "t", QUANT_MCP_INTERNAL_SECRET: "s" },
       async () => {
@@ -558,7 +558,7 @@ describe("registerMiaoshouChatRoutes 注册守卫", () => {
           },
           body: JSON.stringify({ message: "重试", replace_last_turn: true }),
         });
-        expect(response.status).toBe(400);
+        expect(response.status).toBe(200);
       },
     );
   });

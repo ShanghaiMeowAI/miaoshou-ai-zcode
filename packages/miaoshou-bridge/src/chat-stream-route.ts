@@ -148,9 +148,7 @@ export function registerMiaoshouChatRoutes(
     const message = typeof body.message === "string" ? body.message : "";
     const { conversation_id } = body;
     const resumePayload = body.resume;
-    const isResume = Boolean(
-      resumePayload && typeof resumePayload === "object",
-    );
+    let isResume = Boolean(resumePayload && typeof resumePayload === "object");
     const runId =
       typeof body.run_id === "string" && body.run_id
         ? body.run_id
@@ -158,11 +156,6 @@ export function registerMiaoshouChatRoutes(
 
     if (!isResume && !message.trim()) {
       return c.json({ detail: "message 不能为空" }, 400);
-    }
-    if (body.replace_last_turn) {
-      // 前端"重试/编辑上一条"带该字段；桥接层暂不支持替换上一轮语义，
-      // 显式拒绝而不是静默按追加处理，避免界面与模型上下文不一致。
-      return c.json({ detail: "暂不支持替换上一轮，请新开会话重试" }, 400);
     }
 
     const streamSlot = occupyStreamSlot(
@@ -206,8 +199,14 @@ export function registerMiaoshouChatRoutes(
         sweepExpiredPending,
       );
       if (resolution.kind === "none") {
-        releaseStreamSlot();
-        return c.json({ detail: "当前没有待处理的审批" }, 409);
+        if (message.trim()) {
+          // 前端界面残留旧选项卡片导致请求带了 resume，但后端无挂起审批：
+          // 用户输入了新文本，平滑降级为普通对话轮次，不以 409 阻断
+          isResume = false;
+        } else {
+          releaseStreamSlot();
+          return c.json({ detail: "当前没有待处理的审批" }, 409);
+        }
       }
       if (resolution.kind === "invalid_value") {
         releaseStreamSlot();
@@ -219,9 +218,11 @@ export function registerMiaoshouChatRoutes(
           400,
         );
       }
-      pendingResolution = resolution;
-      // 不发新 prompt：被批准的工具在原轮次内继续执行，
-      // 下方观察流把它的执行结果与终态继续推给前端。
+      if (resolution.kind === "resolved") {
+        pendingResolution = resolution;
+        // 不发新 prompt：被批准的工具在原轮次内继续执行，
+        // 下方观察流把它的执行结果与终态继续推给前端。
+      }
     }
 
     let sessionId: string;
@@ -348,8 +349,9 @@ export function registerMiaoshouChatRoutes(
         // finally 仍能释放，不再依赖正常收尾路径逐一清理
         cleanupFns.push(() => clearInterval(heartbeat));
 
-        // assistant 全文累计（回写平台消息表用）
+        // assistant 全文累计与结构化 blocks 收集（回写平台消息表用，防止刷新后工具卡片丢失）
         let assistantText = "";
+        const recordedBlocks: Array<Record<string, unknown>> = [];
 
         let clientAborted = false;
         stream.onAbort(() => {
@@ -380,20 +382,43 @@ export function registerMiaoshouChatRoutes(
         const disposable = subscription(
           (serviceEvent: { type?: string } & Record<string, unknown>) => {
             try {
-              if (serviceEvent.type === "permission.request") {
-                const request = serviceEvent.request as
-                  | {
-                      requestId: string;
-                      toolName: string;
-                      toolCallId?: string;
-                      options?: Array<{
-                        optionId: string;
-                        kind: string;
-                        name: string;
-                      }>;
-                    }
-                  | undefined;
-                if (!request) return;
+              // 兼容 permission.request 与 ZCode 核心协议的 permission.requested
+              // 无论是顶层事件还是嵌套在 session.event 内，统一提取并处理
+              let rawReq: any;
+              if (
+                serviceEvent.type === "permission.request" ||
+                serviceEvent.type === "permission.requested"
+              ) {
+                rawReq =
+                  serviceEvent.request ?? serviceEvent.payload ?? serviceEvent;
+              } else if (
+                serviceEvent.type === "session.event" &&
+                serviceEvent.event &&
+                typeof serviceEvent.event === "object"
+              ) {
+                const inner = serviceEvent.event as {
+                  type?: string;
+                  payload?: any;
+                };
+                if (
+                  inner.type === "permission.request" ||
+                  inner.type === "permission.requested"
+                ) {
+                  rawReq = inner.payload ?? inner;
+                }
+              }
+
+              if (rawReq && (rawReq.toolName || rawReq.name)) {
+                const request = {
+                  requestId: String(
+                    rawReq.requestId || rawReq.id || `req_${Date.now()}`,
+                  ),
+                  toolName: String(rawReq.toolName || rawReq.name || ""),
+                  toolCallId: rawReq.toolCallId
+                    ? String(rawReq.toolCallId)
+                    : undefined,
+                  options: rawReq.options,
+                };
                 // 判定与构造拆在 approval-routes（buildPendingPermission）
                 const { permission, disposition, toolName } =
                   buildPendingPermission({
@@ -436,10 +461,18 @@ export function registerMiaoshouChatRoutes(
                 expiryTimer.unref?.();
                 // 旧前端契约：审批按钮在流式期间禁用，选项以 resume 字段随下一条
                 // 消息回传——因此 interrupt 之后必须给本流发终态，前端才能交互。
-                writeEvent(
-                  buildInterruptPayload(toolName, request.requestId),
-                  false,
+                const interruptPayload = buildInterruptPayload(
+                  toolName,
+                  request.requestId,
                 );
+                recordedBlocks.push({
+                  type: "interrupt",
+                  interruptId: request.requestId,
+                  question: interruptPayload.question,
+                  options: interruptPayload.options,
+                  allowCustom: false,
+                });
+                writeEvent(interruptPayload, false);
                 writeEvent(
                   { type: "done", run_id: runId, interrupted: true },
                   false,
@@ -496,6 +529,16 @@ export function registerMiaoshouChatRoutes(
                       ASSISTANT_TEXT_MAX - assistantText.length,
                     );
                   }
+                  const lastBlock = recordedBlocks[recordedBlocks.length - 1];
+                  if (lastBlock && lastBlock.type === "text") {
+                    lastBlock.content =
+                      String(lastBlock.content || "") + payload.delta;
+                  } else {
+                    recordedBlocks.push({
+                      type: "text",
+                      content: payload.delta,
+                    });
+                  }
                   writeEvent(
                     { type: "message_delta", content: payload.delta },
                     true,
@@ -541,6 +584,12 @@ export function registerMiaoshouChatRoutes(
                     registeredToolNames.get(payload.toolCallId) ??
                     normalizeQuantToolName(payload.toolName ?? "");
                   emittedToolCalls.add(payload.toolCallId);
+                  recordedBlocks.push({
+                    type: "tool_call",
+                    id: payload.toolCallId,
+                    name: eventToolName(toolName),
+                    args: payload.input,
+                  });
                   writeEvent(
                     {
                       type: "tool_call",
@@ -575,16 +624,25 @@ export function registerMiaoshouChatRoutes(
                   }
                   // 旧前端契约：content 是工具输出的业务文本（不是结果信封），
                   // ok 字段供前端判成败（构造与判定拆在 chat-shared）
-                  writeEvent(
-                    buildToolResultPayload({
-                      toolCallId: payload.toolCallId!,
-                      toolName,
-                      kind: payload.kind,
-                      result: payload.result,
-                      errorMessage: payload.error?.message,
-                    }),
-                    false,
-                  );
+                  const trPayload = buildToolResultPayload({
+                    toolCallId: payload.toolCallId!,
+                    toolName,
+                    kind: payload.kind,
+                    result: payload.result,
+                    errorMessage: payload.error?.message,
+                  });
+                  for (let bi = recordedBlocks.length - 1; bi >= 0; bi--) {
+                    const blk = recordedBlocks[bi];
+                    if (
+                      blk &&
+                      blk.type === "tool_call" &&
+                      blk.id === payload.toolCallId
+                    ) {
+                      blk.result = trPayload.content;
+                      break;
+                    }
+                  }
+                  writeEvent(trPayload, false);
                 }
                 return;
               }
@@ -805,6 +863,10 @@ export function registerMiaoshouChatRoutes(
             {
               role: "assistant",
               content: assistantText || "（本轮没有文本回复）",
+              extra:
+                recordedBlocks.length > 0
+                  ? { blocks: recordedBlocks }
+                  : undefined,
             },
           ]).then((ok) => {
             if (!ok) {
