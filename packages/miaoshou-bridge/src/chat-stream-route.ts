@@ -45,6 +45,11 @@ import {
 } from "./approval-routes.js";
 import { handleSessionEvent, type StreamAccumulator } from "./chat-stream-events.js";
 import {
+  createSessionWithModelFallback,
+  resolveRequestedModel,
+  switchSessionModel,
+} from "./chat-model-selection.js";
+import {
   awaitTurnPersist,
   persistResumeUserAction,
   persistTurnResult,
@@ -130,6 +135,9 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
     let isResume = Boolean(resumePayload && typeof resumePayload === "object");
     const runId =
       typeof body.run_id === "string" && body.run_id ? body.run_id : `run_${Date.now()}`;
+    // 前端选中的供应商模型标识（如 deepseek-pro）：命中 ZCode 已启用模型
+    // 就用它创建/切换会话，未命中用默认并记日志
+    const requestedModel = resolveRequestedModel(body.model_id);
 
     if (!isResume && !message.trim()) {
       return c.json({ detail: "message 不能为空" }, 400);
@@ -220,6 +228,13 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
       if (tracked) {
         sessionId = tracked.sessionId;
         tracked.lastUsedAt = Date.now();
+        // 前端切换了模型：同一会话内用 sessionSetModel 生效；
+        // 未指定模型时保持会话现有模型，不主动切回默认
+        await switchSessionModel({
+          set: (model) => rawAgentService.setModel({ workspacePath, sessionId, model }),
+          tracked,
+          requestedModel,
+        });
       } else {
         projectId = await ensureProjectId();
         // 服务端受信路径直接用原始服务创建会话（不经 /ws 包装器——那里对
@@ -227,13 +242,17 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
         // 注意不能用 toolAllowlist:[]——它是全局白名单，会连量化 MCP 工具一起
         // 过滤掉（registerMcpTools 对空集合全跳过）；内置工具收口完全由
         // SESSION_TOOL_DENYLIST 黑名单承担（已覆盖 ReadSessionContext 等免审批工具）
-        const snapshot = await rawAgentService.createSession({
+        const createParams = {
           workspacePath,
           projectId,
-          mode: "build",
+          mode: "build" as const,
           toolDenylist: SESSION_TOOL_DENYLIST,
           mcpServers:
             applyIdentityToMcpServers([structuredClone(quantServerTemplate)], identity) ?? [],
+        };
+        const snapshot = await createSessionWithModelFallback({
+          create: (extra) => rawAgentService.createSession({ ...createParams, ...extra }),
+          requestedModel,
         });
         sessionId = snapshot.session.sessionId;
         registerSessionOwner(sessionId, identity.userId);
@@ -243,6 +262,7 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
           lastUsedAt: Date.now(),
           // 数字会话编号：轮次结束时用它把对话回写进平台的会话消息表
           conversationId: bridgeConversation?.id,
+          modelId: requestedModel?.modelId,
         };
         rememberTracked(
           conversationSessionMap,

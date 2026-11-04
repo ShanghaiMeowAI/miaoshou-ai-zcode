@@ -45,6 +45,8 @@ export interface TrackedConversation {
   lastUsedAt: number;
   /** 平台会话表的数字编号（新链路落库后回写消息用）；回写降级时缺省 */
   conversationId?: number;
+  /** 该会话当前选定的 ZCode 模型标识；未显式选择时缺省（用运行时默认） */
+  modelId?: string;
 }
 
 export interface PendingPermission {
