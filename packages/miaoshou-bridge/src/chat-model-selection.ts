@@ -77,25 +77,40 @@ function loadConfiguredModels(): ZCodeModelSelection[] {
 }
 
 /** 把前端 model_id 解析为 ZCode 模型选择；大小写不敏感，未命中返回 undefined。 */
+export interface ResolvedRequestedModel {
+  selection: ZCodeModelSelection;
+  /** false 表示请求的模型不在清单里，selection 是回退模型 */
+  matched: boolean;
+}
+
+/**
+ * 解析前端请求的模型。未命中清单时回退到清单第一个模型（运维配置顺序的
+ * 第一个即预期默认，通常是便宜的 flash），保证会话一定有可用模型——
+ * 否则新会话没有模型选择，turn 会立即失败（已在线上复现）。
+ * 配置清单为空时返回 undefined（此时确实无模型可用）。
+ */
 export function resolveRequestedModel(
   modelId: unknown,
   reasoningEffort?: unknown,
-): ZCodeModelSelection | undefined {
+): ResolvedRequestedModel | undefined {
+  const models = loadConfiguredModels();
+  const fallback = models[0];
+  if (!fallback) return undefined;
   const wanted = typeof modelId === "string" ? modelId.trim().toLowerCase() : "";
-  if (!wanted) return undefined;
-  const model = loadConfiguredModels().find(
-    (candidate) => candidate.modelId.toLowerCase() === wanted,
-  );
-  if (!model) return undefined;
   const effort =
     typeof reasoningEffort === "string"
       ? REASONING_EFFORT_ALIASES[reasoningEffort.trim().toLowerCase()]
       : undefined;
-  return {
+  const build = (model: ZCodeModelSelection): ZCodeModelSelection => ({
     providerId: model.providerId,
     modelId: model.modelId,
     options: { reasoningLevel: effort ?? "low" },
-  };
+  });
+  if (wanted) {
+    const matched = models.find((candidate) => candidate.modelId.toLowerCase() === wanted);
+    if (matched) return { selection: build(matched), matched: true };
+  }
+  return { selection: build(fallback), matched: false };
 }
 
 /** 带模型创建会话；选中的模型在运行时不可用时回退默认并留痕，保证对话可用。 */

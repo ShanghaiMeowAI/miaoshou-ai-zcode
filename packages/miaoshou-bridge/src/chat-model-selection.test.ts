@@ -37,33 +37,38 @@ describe("resolveRequestedModel", () => {
       writeProviderConfig(base, ["deepseek-flash", "deepseek-pro"]);
       vi.stubEnv("ZCODE_DATA_BASE_DIR", base);
       const { resolveRequestedModel } = await import("./chat-model-selection.js");
-      expect(resolveRequestedModel("deepseek-pro")).toMatchObject({
+      const resolved = resolveRequestedModel("deepseek-pro");
+      expect(resolved?.matched).toBe(true);
+      expect(resolved?.selection).toMatchObject({
         providerId: "personal:deepseek",
         modelId: "deepseek-pro",
         options: { reasoningLevel: "low" },
       });
-      expect(resolveRequestedModel("deepseek-pro", "high")?.options).toEqual({
+      expect(resolveRequestedModel("deepseek-pro", "high")?.selection.options).toEqual({
         reasoningLevel: "high",
       });
-      expect(resolveRequestedModel("deepseek-pro", "medium")?.options).toEqual({
+      expect(resolveRequestedModel("deepseek-pro", "medium")?.selection.options).toEqual({
         reasoningLevel: "low",
       });
-      expect(resolveRequestedModel("DeepSeek-Pro")?.modelId).toBe("deepseek-pro");
+      expect(resolveRequestedModel("DeepSeek-Pro")?.selection.modelId).toBe("deepseek-pro");
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
   });
 
-  it("未配置/未启用/空值时返回 undefined（回退默认模型）", async () => {
+  it("未命中清单时回退第一个模型（matched=false）", async () => {
     const base = mkdtempSync(join(tmpdir(), "zcode-model-"));
     try {
       writeProviderConfig(base, ["deepseek-flash"]);
       vi.stubEnv("ZCODE_DATA_BASE_DIR", base);
       const { resolveRequestedModel } = await import("./chat-model-selection.js");
-      expect(resolveRequestedModel("deepseek-pro")).toBeUndefined();
-      expect(resolveRequestedModel("")).toBeUndefined();
-      expect(resolveRequestedModel(undefined)).toBeUndefined();
-      expect(resolveRequestedModel(123)).toBeUndefined();
+      const fallback = resolveRequestedModel("deepseek-pro");
+      expect(fallback?.matched).toBe(false);
+      expect(fallback?.selection.modelId).toBe("deepseek-flash");
+      expect(fallback?.selection.providerId).toBe("personal:deepseek");
+      const empty = resolveRequestedModel("");
+      expect(empty?.selection.modelId).toBe("deepseek-flash");
+      expect(resolveRequestedModel(123)?.selection.modelId).toBe("deepseek-flash");
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

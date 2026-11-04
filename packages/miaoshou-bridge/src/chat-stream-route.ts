@@ -135,9 +135,18 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
     let isResume = Boolean(resumePayload && typeof resumePayload === "object");
     const runId =
       typeof body.run_id === "string" && body.run_id ? body.run_id : `run_${Date.now()}`;
-    // 前端选中的供应商模型标识（如 deepseek-pro）：命中 ZCode 已启用模型
-    // 就用它创建/切换会话，未命中用默认并记日志
-    const requestedModel = resolveRequestedModel(body.model_id, body.reasoning_effort);
+    // 前端选中的供应商模型标识（如 deepseek-v4-pro）：命中已启用清单就用它；
+    // 未命中回退清单第一个模型并记日志（新会话没有模型会立即失败）
+    const resolvedModel = resolveRequestedModel(
+      body.model_id,
+      body.reasoning_effort,
+    );
+    const requestedModel = resolvedModel?.selection;
+    if (resolvedModel && !resolvedModel.matched) {
+      console.error(
+        `[miaoshou-bridge] 请求的模型 ${String(body.model_id)} 不在 ZCode 已启用清单中，回退 ${requestedModel?.modelId}`,
+      );
+    }
 
     if (!isResume && !message.trim()) {
       return c.json({ detail: "message 不能为空" }, 400);
@@ -377,6 +386,9 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
           getBlocks: () => recordedBlocks,
         });
         cleanupFns.push(() => runWriter.dispose());
+        // 初始快照立即写(不等节流):用户在轮次刚开始时刷新,也要能拿到
+        // active_run_id 与恢复卡片
+        runWriter.finish().catch(() => {});
         runWriter.markDirty();
 
         stream.onAbort(() => {
@@ -561,10 +573,18 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
                 const failure = (event.payload ?? {}) as {
                   error?: { message?: string };
                 };
+                const failureMessage = failure.error?.message ?? "本轮执行失败";
+                // 失败原因以文本块落库:前端无 error 块类型,文本块可正常回显,
+                // 历史里能查到失败原因
+                recordedBlocks.push({
+                  type: "text",
+                  content: `本轮执行失败：${failureMessage}`,
+                });
+                runWriter.markDirty();
                 writeEvent(
                   {
                     type: "error",
-                    message: failure.error?.message ?? "本轮执行失败",
+                    message: failureMessage,
                     error: failure.error?.message ?? "turn_failed",
                     run_id: runId,
                   },
@@ -676,6 +696,11 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
             })
             .catch((error) => {
               const errorText = `调用模型失败：${error instanceof Error ? error.message : String(error)}`;
+              recordedBlocks.push({
+                type: "text",
+                content: errorText,
+              });
+              runWriter.markDirty();
               writeEvent(
                 {
                   type: "error",
