@@ -32,6 +32,11 @@ quant MCP 配置，并提供平台前端兼容的 SSE 聊天、审批与取消�
 - 工具卡片以"实际到达的事件"为准落库：runtime 对部分工具只投 result 不投
   scheduled，result 分支补记带结果的卡片；恢复流对挂起工具不重复下发卡片
   事件但补记 blocks。刷新后每一轮的工具卡片都必须可见。
+- 未登记量化白名单的工具一律自动拒绝，拒绝必须有终态：CLI 在审批拒绝后
+  不投 ToolCallResult，桥接层在拒绝分支合成 ok:false 的 tool_result 事件
+  并把 result 写进落库卡片。无 result 的卡片会被平台读取接口按旧契约过滤，
+  静默拒绝等于前端不可见、刷新后消失（生产事故：market_get_latest_trade_date
+  漏登记，回测前的交易日查询每轮被静默拒绝）。
 - 编辑/重试走 ZCode 官方 v4 命令（editUserQuery/retryTurn）：行标识从
   conversationRowsRangeV4 的行投影按角色+文本+occurrence 解析（缺 entityId 的
   旧帧行跳过），CAS 水位取同一查询的 atRevision/atLogEpoch。命令受理成功后

@@ -13,6 +13,7 @@ import { randomUUID } from "node:crypto";
 import { createZCodeAgentConnectionScope } from "@zcode/services";
 import {
   BRIDGE_COMMAND_CLIENT_ID,
+  applySyntheticToolResult,
   buildCommandEnvelope,
   conversationSessionMap,
   consumeSessionEventId,
@@ -485,6 +486,9 @@ export async function handleMessageCommand(
                   false,
                 );
               },
+              // 自动拒绝的落库收尾与聊天流同一实现（applySyntheticToolResult）
+              recordSyntheticResult: (toolCallId: string, toolName: string, content: string) =>
+                applySyntheticToolResult(recordedBlocks, toolCallId, toolName, content),
             },
           });
           if (handled) {

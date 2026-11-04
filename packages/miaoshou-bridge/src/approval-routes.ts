@@ -9,6 +9,7 @@ import {
   QUANT_MUTATION_TOOLS,
   QUANT_READONLY_TOOLS,
   buildCommandEnvelope,
+  eventToolName,
   isCommandAckOk,
   normalizeQuantToolName,
   pendingPermissions,
@@ -212,6 +213,12 @@ export interface PermissionStreamHooks {
   /** 挂起处置：登记挂起审批、记录卡片、下发 interrupt 并终态化本流 */
   suspendStream(permission: PendingPermission, interruptPayload: unknown): void;
   onAutoApproveError(toolName: string, error?: string): void;
+  /**
+   * 自动拒绝的落库收尾：把合成终态写进 recordedBlocks 里对应的工具卡。
+   * CLI 在审批拒绝后不再投递 ToolCallResult，不补写的话卡片永远停在
+   * "无 result"状态，平台读取接口会按旧契约把它过滤掉，刷新后卡片消失。
+   */
+  recordSyntheticResult(toolCallId: string, toolName: string, content: string): void;
 }
 
 export function handlePermissionRequestedEvent(params: {
@@ -268,7 +275,28 @@ export function handlePermissionRequestedEvent(params: {
     return true;
   }
   if (disposition === "reject") {
-    // 非量化工具一律拒绝，避免未评估的能力被静默执行
+    // 非量化工具一律拒绝，避免未评估的能力被静默执行。
+    // 拒绝不能只回给模型：CLI 在审批拒绝后不投 ToolCallResult，不合成终态的
+    // 话前端既看不到失败卡，落库的无 result 卡片也会被平台读取接口过滤掉，
+    // 排查时只能翻日志（生产事故：market_get_latest_trade_date 漏登记，
+    // 每轮回测前查询被静默拒绝，模型反复向用户要日期）。
+    console.warn(
+      `[miaoshou-bridge] 工具 ${toolName} 未登记量化白名单，自动拒绝（requestId=${request.requestId}）`,
+    );
+    const deniedContent = "该工具调用已被拒绝：未登记的量化工具，未执行。";
+    if (permission.toolCallId) {
+      params.hooks.writeEvent(
+        {
+          type: "tool_result",
+          id: permission.toolCallId,
+          name: eventToolName(toolName),
+          ok: false,
+          content: deniedContent,
+        },
+        false,
+      );
+      params.hooks.recordSyntheticResult(permission.toolCallId, toolName, deniedContent);
+    }
     void params.resolve(permission, false).catch(() => {});
     return true;
   }

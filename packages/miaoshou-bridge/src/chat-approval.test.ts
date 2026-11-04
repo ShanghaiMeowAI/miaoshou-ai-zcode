@@ -120,6 +120,120 @@ describe("registerMiaoshouChatRoutes 审批与回放", () => {
       }
     });
   });
+  it("未登记工具自动拒绝：合成 tool_result 终态并落库，卡片刷新后可见", async () => {
+    await withEnv({ ZCODE_SERVER_AUTH_TOKEN: "t", QUANT_MCP_INTERNAL_SECRET: "s" }, async () => {
+      const { pendingPermissions, conversationSessionMap } = await import("./chat-shared.js");
+      pendingPermissions.clear();
+      conversationSessionMap.clear();
+      conversationSessionMap.set("42:t889", {
+        userId: "42",
+        sessionId: "sess_x",
+        lastUsedAt: Date.now(),
+        conversationId: 889,
+      });
+      const fetchCalls: Array<{
+        url: string;
+        body?: Record<string, unknown>;
+      }> = [];
+      vi.stubGlobal("fetch", stubBridgeFetch(fetchCalls));
+      // 生产时序复刻：runtime 先投 scheduled（卡片已发出），再投
+      // permission.requested（未登记工具 → 自动拒绝），CLI 拒绝后不投
+      // ToolCallResult，终态必须由桥接层合成
+      const seqServices = {
+        get: () => ({
+          onDynamicSessionEvent:
+            () =>
+            (cb: (event: unknown) => void): { dispose: () => void } => {
+              queueMicrotask(() => {
+                cb({
+                  type: "session.event",
+                  event: {
+                    type: "turn.started",
+                    eventId: "evt-889-ts",
+                    payload: { foregroundExecutionId: "exec-889" },
+                  },
+                });
+                cb({
+                  type: "session.event",
+                  event: {
+                    type: "tool.updated",
+                    eventId: "evt-889-sched",
+                    payload: {
+                      kind: "scheduled",
+                      toolCallId: "call_unk_1",
+                      toolName: "unknown_tool_x",
+                    },
+                  },
+                });
+                cb({
+                  type: "session.event",
+                  event: {
+                    type: "permission.requested",
+                    eventId: "evt-889-perm",
+                    payload: {
+                      requestId: "perm_889",
+                      toolName: "unknown_tool_x",
+                      toolCallId: "call_unk_1",
+                      options: [{ optionId: "a1", kind: "allow_once", name: "允许" }],
+                    },
+                  },
+                });
+                cb({
+                  type: "session.event",
+                  event: {
+                    type: "turn.completed",
+                    eventId: "evt-889-done",
+                    payload: { resultType: "success", response: "ok" },
+                  },
+                });
+              });
+              return { dispose: () => {} };
+            },
+          sendConversationCommandV4: async () => ({ status: "accepted" }),
+          closeSession: async () => true,
+          createSession: async () => ({ session: { sessionId: "sess_x" } }),
+          sendPrompt: async () => ({ ok: true }),
+        }),
+        getOptional: () => undefined,
+      } as unknown as Parameters<typeof registerMiaoshouChatRoutes>[1];
+      try {
+        const app = new Hono();
+        registerMiaoshouChatRoutes(app, seqServices);
+        const response = await app.request("/api/agent/chat", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-platform-token": "t",
+            "x-user-id": "42",
+            "x-user-role": "user",
+          },
+          body: JSON.stringify({
+            conversation_id: 889,
+            message: "试试新能力",
+            run_id: "run-889",
+          }),
+        });
+        const text = await response.text();
+        // 前端即时可见：合成终态 tool_result（失败），不是静默拒绝
+        expect(text).toContain('"type":"tool_result"');
+        expect(text).toContain('"ok":false');
+        expect(text).toContain("该工具调用已被拒绝");
+        // 落库块带 result：平台读取接口只过滤无 result 的卡片，带终态的卡片刷新后可见
+        const messageCalls = fetchCalls.filter((call) =>
+          call.url.includes("/internal/bridge/messages"),
+        );
+        const assistantCall = messageCalls.find((call) => call.body?.role === "assistant");
+        const serialized = JSON.stringify(assistantCall?.body ?? {});
+        expect(serialized).toContain("call_unk_1");
+        expect(serialized).toContain("该工具调用已被拒绝");
+      } finally {
+        vi.unstubAllGlobals();
+        pendingPermissions.clear();
+        conversationSessionMap.clear();
+      }
+    });
+  });
+
   it("拒绝回执后为挂起工具补 tool_result 终态", async () => {
     await withEnv({ ZCODE_SERVER_AUTH_TOKEN: "t", QUANT_MCP_INTERNAL_SECRET: "s" }, async () => {
       const { pendingPermissions, conversationSessionMap } = await import("./chat-shared.js");

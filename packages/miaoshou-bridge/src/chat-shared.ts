@@ -35,6 +35,9 @@ export const QUANT_READONLY_TOOLS = new Set([
   "catalog_get_industries",
   "formula_compose_and_check",
   "backtest_get_analysis",
+  // 回测结束日期的强制来源：策略工具描述要求模型必须先调它取交易日，
+  // 漏登记会让每次回测前的查询被自动拒绝，模型只能反复向用户要日期
+  "market_get_latest_trade_date",
 ]);
 /** 写操作量化工具：必须经用户在界面上确认 */
 export const QUANT_MUTATION_TOOLS = new Set(["strategy_save", "backtest_run"]);
@@ -275,6 +278,32 @@ const EVENT_TOOL_NAME_ALIASES: Record<string, string> = {
 
 export function eventToolName(toolName: string): string {
   return EVENT_TOOL_NAME_ALIASES[toolName] ?? toolName;
+}
+
+/**
+ * 自动拒绝的落库收尾：终态写进已发出的卡片；scheduled 事件缺席的少数工具
+ * 没有可匹配的卡片，补记一张带结果的失败卡。不带 result 的卡片会被平台
+ * 读取接口按旧契约过滤（刷新后消失），聊天流与命令流共用同一实现。
+ */
+export function applySyntheticToolResult(
+  recordedBlocks: Array<Record<string, unknown>>,
+  toolCallId: string,
+  toolName: string,
+  content: string,
+): void {
+  for (let i = recordedBlocks.length - 1; i >= 0; i--) {
+    const block = recordedBlocks[i];
+    if (block?.type === "tool_call" && block.id === toolCallId) {
+      block.result = content;
+      return;
+    }
+  }
+  recordedBlocks.push({
+    type: "tool_call",
+    id: toolCallId,
+    name: eventToolName(toolName),
+    result: content,
+  });
 }
 
 export function normalizeQuantToolName(toolName: string): string {

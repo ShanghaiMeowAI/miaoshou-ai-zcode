@@ -17,6 +17,7 @@ import {
   MAX_TRACKED_PER_USER,
   PENDING_PERMISSION_TTL_MS,
   SESSION_TOOL_DENYLIST,
+  applySyntheticToolResult,
   consumeSessionEventId,
   conversationSessionMap,
   createProjectIdResolver,
@@ -490,6 +491,8 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
                   setFinalDone: (done) => {
                     finalDoneEvent = done;
                   },
+                  recordSyntheticResult: (toolCallId, toolName, content) =>
+                    applySyntheticToolResult(recordedBlocks, toolCallId, toolName, content),
                   suspendStream,
                   onAutoApproveError: (toolName, error) => {
                     writeEvent(
