@@ -21,7 +21,6 @@ import {
   SESSION_IDLE_TTL_MS,
   SESSION_TOOL_DENYLIST,
   STREAM_TIMEOUT_MS,
-  buildCommandEnvelope,
   consumeSessionEventId,
   conversationSessionMap,
   createProjectIdResolver,
@@ -44,6 +43,7 @@ import {
   sweepExpiredPendingWith,
 } from "./approval-routes.js";
 import { handleSessionEvent, type StreamAccumulator } from "./chat-stream-events.js";
+import { createRunSnapshotWriter } from "./chat-run-sync.js";
 import {
   createSessionWithModelFallback,
   resolveRequestedModel,
@@ -369,15 +369,21 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
           stickyTruncated: false,
           queuedDeltaBytes: 0,
         };
+        // 运行快照:写平台 agent_runs,供运行时接口与刷新后的运行恢复读取
+        const runWriter = createRunSnapshotWriter({
+          conversationId: tracked.conversationId,
+          runId,
+          userId: identity.userId,
+          getBlocks: () => recordedBlocks,
+        });
+        cleanupFns.push(() => runWriter.dispose());
+        runWriter.markDirty();
 
-        let clientAborted = false;
         stream.onAbort(() => {
-          // 断线不直接置 settled：让下方统一的停止流程发 stop 停掉本轮执行，
-          // 避免客户端断开后留下无法取消的孤儿执行；同时标记原因，
-          // 收尾时不再把"客户端断开"伪装成"等待执行结果超时"
-          clientAborted = true;
+          // 与 ZCode 官方语义一致：执行属于运行时不依赖客户端连接。
+          // 断线只释放并发槽位，本轮继续执行、继续收集事件，
+          // 结束时照常落库并更新运行快照；前端刷新后凭快照恢复。
           releaseStreamSlot();
-          finishSignal.resolve();
         });
 
         writeEvent({
@@ -481,7 +487,10 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
                   },
                 },
               });
-              if (handled) return;
+              if (handled) {
+                runWriter.markDirty();
+                return;
+              }
 
               if (serviceEvent.type !== "session.event") return;
               const event = serviceEvent.event as
@@ -506,6 +515,7 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
                   writeEvent,
                 })
               ) {
+                runWriter.markDirty();
                 return;
               }
 
@@ -654,14 +664,6 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
 
         // resume 观察流不发新 prompt：被批准的工具在原轮次内继续执行，
         // 本流只负责把它的执行结果与终态推送给前端。
-        let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-        const timeout = new Promise<void>((resolve) => {
-          timeoutHandle = setTimeout(resolve, STREAM_TIMEOUT_MS);
-          timeoutHandle.unref?.();
-        });
-        cleanupFns.push(() => {
-          if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
-        });
         if (!isResume) {
           // 不阻塞等待 sendPrompt 返回：无论它何时 resolve/reject，终态都由
           // 事件流或超时兜底，避免发送环节挂起拖住整个流
@@ -689,42 +691,8 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
             });
         }
 
-        await Promise.race([finished, timeout]);
-        if (!settled) {
-          // 客户端断开（对端已不在，不写事件）与真超时的共同动作是停掉本轮，
-          // 避免孤儿执行继续消耗额度；只有真超时才写"超时"终态——
-          // 断开不能被伪装成"等待执行结果超时"的假信号
-          if (!clientAborted) {
-            writeEvent(
-              {
-                type: "error",
-                message: "等待执行结果超时",
-                error: "stream_timeout",
-                run_id: runId,
-              },
-              false,
-            );
-            finalDoneEvent = {
-              type: "done",
-              run_id: runId,
-              truncated: accumulator.truncated,
-              timeout: true,
-            };
-          }
-          settled = true;
-          void rawAgentService
-            .sendConversationCommandV4({
-              workspacePath,
-              envelope: buildCommandEnvelope(
-                "stop",
-                foregroundExecutionId
-                  ? { expectedForegroundExecutionId: foregroundExecutionId }
-                  : {},
-                sessionId,
-              ),
-            })
-            .catch(() => {});
-        }
+        // 与官方一致：没有客户端等待上限，轮次由 turn 终态结束
+        await finished;
         // heartbeat/订阅/超时句柄的释放统一由 finally 的 cleanupFns 执行，
         // 此处不再重复清理
         runRegistry.delete(runKey);
@@ -744,7 +712,10 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
             }),
           );
         }
-        // 保留本会话挂起的审批等待 resume 回执；流因超时等原因结束且无人应答时，
+        // 消息落库之后再置运行完成：前端刷新时优先看到完整消息，
+        // 不会把已结束的轮次误判为运行中
+        await runWriter.finish();
+        // 保留本会话挂起的审批等待 resume 回执；流异常结束且无人应答时，
         // 直接拒绝避免工具悬挂
         if (!interruptedEnd) {
           pendingPermissions.forEach((permission, requestId) => {

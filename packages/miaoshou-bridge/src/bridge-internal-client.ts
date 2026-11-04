@@ -19,16 +19,10 @@ function internalBaseUrl(): string {
 }
 
 function internalSecret(): string | undefined {
-  return (
-    process.env.QUANT_MCP_INTERNAL_SECRET ||
-    process.env.MIAOSHOU_QUANT_INTERNAL_SECRET
-  );
+  return process.env.QUANT_MCP_INTERNAL_SECRET || process.env.MIAOSHOU_QUANT_INTERNAL_SECRET;
 }
 
-async function internalPost(
-  path: string,
-  body: unknown,
-): Promise<unknown | undefined> {
+async function internalPost(path: string, body: unknown): Promise<unknown | undefined> {
   const secret = internalSecret();
   if (!secret) return undefined;
   try {
@@ -46,6 +40,32 @@ async function internalPost(
   } catch {
     return undefined;
   }
+}
+
+export interface BridgeRunSnapshot {
+  conversationId: number;
+  runId: string;
+  userId: string;
+  status: "running" | "completed" | "failed" | "interrupted";
+  blocks: Array<Record<string, unknown>>;
+  errorCode?: string;
+  errorMessage?: string;
+}
+
+/**
+ * 运行快照回写（agent_runs 表）：旧链路的运行时接口与刷新恢复都读这张表。
+ * fire-and-forget：失败只影响刷新恢复，不影响对话本身。
+ */
+export function upsertBridgeRun(snapshot: BridgeRunSnapshot): void {
+  void internalPost("/internal/bridge/runs", {
+    conversation_id: snapshot.conversationId,
+    run_id: snapshot.runId,
+    user_id: snapshot.userId,
+    status: snapshot.status,
+    blocks: snapshot.blocks,
+    error_code: snapshot.errorCode,
+    error_message: snapshot.errorMessage,
+  });
 }
 
 async function internalGet(path: string): Promise<unknown | undefined> {
@@ -74,11 +94,7 @@ export async function createBridgeConversation(
     thread_id: threadId,
     title,
   })) as { id?: unknown; thread_id?: unknown } | undefined;
-  if (
-    !result ||
-    typeof result.id !== "number" ||
-    typeof result.thread_id !== "string"
-  ) {
+  if (!result || typeof result.id !== "number" || typeof result.thread_id !== "string") {
     return undefined;
   }
   const conversation = { id: result.id, threadId: result.thread_id };
@@ -92,14 +108,10 @@ export async function lookupBridgeConversation(
 ): Promise<BridgeConversation | undefined> {
   const cached = CONVERSATION_LOOKUP_CACHE.get(conversationId);
   if (cached) return cached;
-  const result = (await internalGet(
-    `/internal/bridge/conversations/${conversationId}`,
-  )) as { id?: unknown; thread_id?: unknown } | undefined;
-  if (
-    !result ||
-    typeof result.id !== "number" ||
-    typeof result.thread_id !== "string"
-  ) {
+  const result = (await internalGet(`/internal/bridge/conversations/${conversationId}`)) as
+    | { id?: unknown; thread_id?: unknown }
+    | undefined;
+  if (!result || typeof result.id !== "number" || typeof result.thread_id !== "string") {
     return undefined;
   }
   const conversation = { id: result.id, threadId: result.thread_id };
