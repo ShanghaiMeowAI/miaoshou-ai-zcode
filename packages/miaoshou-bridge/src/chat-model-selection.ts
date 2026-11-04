@@ -13,7 +13,20 @@ import { join } from "node:path";
 export interface ZCodeModelSelection {
   providerId: string;
   modelId: string;
+  options?: { reasoningLevel: string };
 }
+
+/**
+ * 妙手额度接口的档位词汇（low/medium/high/max）映射到 ZCode 档位。
+ * ZCode DeepSeek 模型的合法档位是 disabled/low/high/max（内置 modelRules），
+ * 没有 medium；映射缺失时用 low（disabled 会关闭思考，不适合做缺省）。
+ */
+const REASONING_EFFORT_ALIASES: Record<string, string> = {
+  low: "low",
+  medium: "low",
+  high: "high",
+  max: "max",
+};
 
 interface CacheEntry {
   mtimeMs: number;
@@ -64,10 +77,25 @@ function loadConfiguredModels(): ZCodeModelSelection[] {
 }
 
 /** 把前端 model_id 解析为 ZCode 模型选择；大小写不敏感，未命中返回 undefined。 */
-export function resolveRequestedModel(modelId: unknown): ZCodeModelSelection | undefined {
+export function resolveRequestedModel(
+  modelId: unknown,
+  reasoningEffort?: unknown,
+): ZCodeModelSelection | undefined {
   const wanted = typeof modelId === "string" ? modelId.trim().toLowerCase() : "";
   if (!wanted) return undefined;
-  return loadConfiguredModels().find((model) => model.modelId.toLowerCase() === wanted);
+  const model = loadConfiguredModels().find(
+    (candidate) => candidate.modelId.toLowerCase() === wanted,
+  );
+  if (!model) return undefined;
+  const effort =
+    typeof reasoningEffort === "string"
+      ? REASONING_EFFORT_ALIASES[reasoningEffort.trim().toLowerCase()]
+      : undefined;
+  return {
+    providerId: model.providerId,
+    modelId: model.modelId,
+    options: { reasoningLevel: effort ?? "low" },
+  };
 }
 
 /** 带模型创建会话；选中的模型在运行时不可用时回退默认并留痕，保证对话可用。 */

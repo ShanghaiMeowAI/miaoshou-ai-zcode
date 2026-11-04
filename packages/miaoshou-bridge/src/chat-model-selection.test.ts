@@ -37,9 +37,16 @@ describe("resolveRequestedModel", () => {
       writeProviderConfig(base, ["deepseek-flash", "deepseek-pro"]);
       vi.stubEnv("ZCODE_DATA_BASE_DIR", base);
       const { resolveRequestedModel } = await import("./chat-model-selection.js");
-      expect(resolveRequestedModel("deepseek-pro")).toEqual({
+      expect(resolveRequestedModel("deepseek-pro")).toMatchObject({
         providerId: "personal:deepseek",
         modelId: "deepseek-pro",
+        options: { reasoningLevel: "low" },
+      });
+      expect(resolveRequestedModel("deepseek-pro", "high")?.options).toEqual({
+        reasoningLevel: "high",
+      });
+      expect(resolveRequestedModel("deepseek-pro", "medium")?.options).toEqual({
+        reasoningLevel: "low",
       });
       expect(resolveRequestedModel("DeepSeek-Pro")?.modelId).toBe("deepseek-pro");
     } finally {

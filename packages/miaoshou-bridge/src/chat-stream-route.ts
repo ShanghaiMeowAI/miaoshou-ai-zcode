@@ -137,7 +137,7 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
       typeof body.run_id === "string" && body.run_id ? body.run_id : `run_${Date.now()}`;
     // 前端选中的供应商模型标识（如 deepseek-pro）：命中 ZCode 已启用模型
     // 就用它创建/切换会话，未命中用默认并记日志
-    const requestedModel = resolveRequestedModel(body.model_id);
+    const requestedModel = resolveRequestedModel(body.model_id, body.reasoning_effort);
 
     if (!isResume && !message.trim()) {
       return c.json({ detail: "message 不能为空" }, 400);
