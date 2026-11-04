@@ -119,6 +119,10 @@ export async function createSessionWithModelFallback<T>(params: {
   requestedModel: ZCodeModelSelection | undefined;
 }): Promise<T> {
   if (!params.requestedModel) return params.create({});
+  console.error(
+    `[miaoshou-bridge][diag] createSession model=`,
+    JSON.stringify(params.requestedModel),
+  );
   try {
     return await params.create({ model: params.requestedModel });
   } catch (error) {
