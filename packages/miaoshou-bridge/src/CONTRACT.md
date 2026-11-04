@@ -30,6 +30,12 @@ quant MCP 配置，并提供平台前端兼容的 SSE 聊天、审批与取消�
 - 工具卡片以"实际到达的事件"为准落库：runtime 对部分工具只投 result 不投
   scheduled，result 分支补记带结果的卡片；恢复流对挂起工具不重复下发卡片
   事件但补记 blocks。刷新后每一轮的工具卡片都必须可见。
+- 编辑/重试走 ZCode 官方 v4 命令（editUserQuery/retryTurn）：行标识从
+  conversationRowsRangeV4 的行投影按角色+文本+occurrence 解析（缺 entityId 的
+  旧帧行跳过），CAS 水位取同一查询的 atRevision/atLogEpoch。命令受理成功后
+  平台消息表按同边界截断（经会话串行链，先于命令轮落库），观察流与聊天流
+  同格式（回放去重/审批挂起/落库收尾全部复用）。服务重启后 tracked 丢失，
+  历史轮次的编辑/重试显式 409，绝不静默改写到错误的新会话上。
 
 与其它模块的交集：
 

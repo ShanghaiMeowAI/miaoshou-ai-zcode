@@ -1,0 +1,555 @@
+/**
+ * 会话历史操作：编辑重发（editUserQuery）与重试轮次（retryTurn）。
+ * 照 ZCode 官方机制：两条命令都以 {rowId, entityId} 定位投影行，由 runtime
+ * 完成 conversation rewind 后重跑。桥接层按需从行投影解析行标识与 CAS 水位
+ * （rows/range 的 atRevision/atLogEpoch），命令发出后打开与聊天流同格式的
+ * 观察 SSE：复用回放去重、审批挂起、文本/工具卡片累计与收尾落库，前端直接
+ * 复用既有 SSE 消费与审批回执链路。
+ */
+import type { Context } from "hono";
+import { Hono } from "hono";
+import { streamSSE } from "hono/streaming";
+import {
+  buildCommandEnvelope,
+  conversationSessionMap,
+  consumeSessionEventId,
+  enqueueConversationWrite,
+  isCommandAckOk,
+  pendingPermissions,
+  type PendingPermission,
+  type TrackedConversation,
+} from "./chat-shared.js";
+import { handleSessionEvent, type StreamAccumulator } from "./chat-stream-events.js";
+import { handlePermissionRequestedEvent, resolvePermissionWith } from "./approval-routes.js";
+import { createRunSnapshotWriter } from "./chat-run-sync.js";
+import { awaitTurnPersist, persistTurnResult } from "./chat-persistence.js";
+
+const HEARTBEAT_INTERVAL_MS = 15_000;
+const MAX_QUEUED_DELTA_BYTES = 512 * 1024;
+/** 行投影翻窗上限：每窗 200 行，最多回看 3 窗（约几十轮历史） */
+const ROWS_WINDOW_LIMIT = 200;
+const ROWS_MAX_WINDOWS = 3;
+/** 文本匹配窗口：行与平台消息都可能在存储层被截断，取前缀比对 */
+const TEXT_MATCH_PREFIX = 400;
+
+interface CommandAgentService {
+  sendConversationCommandV4(params: {
+    workspacePath: string;
+    envelope: Record<string, unknown>;
+  }): Promise<unknown>;
+  conversationRowsRangeV4(params: {
+    workspacePath: string;
+    sessionId: string;
+    limit: number;
+    beforeRowId?: number;
+  }): Promise<{
+    rows: Array<Record<string, unknown>>;
+    hasMore: boolean;
+    atRevision: number;
+    atLogEpoch: string;
+  }>;
+  onDynamicSessionEvent(params: {
+    workspacePath: string;
+    sessionId: string;
+    deliveryKind: string;
+  }): (callback: (serviceEvent: { type?: string } & Record<string, unknown>) => void) => {
+    dispose?: () => void;
+  };
+}
+
+export interface HistoryCommandDeps {
+  workspacePath: string;
+  rawAgentService: CommandAgentService;
+  extractIdentity: (headers: unknown) => { userId: string } | undefined;
+}
+
+function internalBaseUrl(): string {
+  return process.env.AGENT_INTERNAL_BASE_URL?.trim() || "http://127.0.0.1:5005";
+}
+
+function internalSecret(): string | undefined {
+  return process.env.QUANT_MCP_INTERNAL_SECRET || process.env.MIAOSHOU_QUANT_INTERNAL_SECRET;
+}
+
+interface PlatformMessage {
+  id: number;
+  conversation_id: number;
+  role: string;
+  content: string;
+}
+
+async function fetchPlatformMessage(
+  messageId: number,
+  userId: string,
+): Promise<PlatformMessage | undefined> {
+  const secret = internalSecret();
+  if (!secret) return undefined;
+  try {
+    const response = await fetch(
+      `${internalBaseUrl()}/internal/bridge/messages/${messageId}?user_id=${encodeURIComponent(userId)}`,
+      { signal: AbortSignal.timeout(5000), headers: { "X-Internal-Secret": secret } },
+    );
+    if (!response.ok) return undefined;
+    return (await response.json()) as PlatformMessage;
+  } catch {
+    return undefined;
+  }
+}
+
+async function fetchThreadIdentity(
+  conversationId: number,
+): Promise<{ thread_id: string } | undefined> {
+  const secret = internalSecret();
+  if (!secret) return undefined;
+  try {
+    const response = await fetch(
+      `${internalBaseUrl()}/internal/bridge/conversations/${conversationId}`,
+      { signal: AbortSignal.timeout(5000), headers: { "X-Internal-Secret": secret } },
+    );
+    if (!response.ok) return undefined;
+    return (await response.json()) as { thread_id: string };
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeText(value: string): string {
+  return value.replace(/\s+/g, " ").trim().slice(0, TEXT_MATCH_PREFIX);
+}
+
+/**
+ * 平台消息表同步截断：runtime rewind 掉旧轮后，agent_messages 是追加式表，
+ * 不同步删除的话刷新后旧轮会以"追加"形态复活（编辑语义在存储层失效）。
+ * 经会话串行链执行，保证先于命令轮的落库完成。
+ */
+async function truncateFromMessage(
+  conversationId: number,
+  messageId: number,
+  userId: string,
+): Promise<void> {
+  const secret = internalSecret();
+  if (!secret) return;
+  try {
+    const response = await fetch(
+      `${internalBaseUrl()}/internal/bridge/messages/${messageId}/trailing?user_id=${encodeURIComponent(userId)}`,
+      {
+        method: "DELETE",
+        signal: AbortSignal.timeout(5000),
+        headers: { "X-Internal-Secret": secret },
+      },
+    );
+    if (!response.ok) {
+      console.error(`[miaoshou-bridge] 消息截断失败 HTTP ${response.status}（消息 ${messageId}）`);
+    }
+  } catch (error) {
+    console.error(
+      `[miaoshou-bridge] 消息截断请求异常（消息 ${messageId}）`,
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+}
+
+interface RowTarget {
+  rowId: number;
+  entityId: string;
+}
+
+/**
+ * 在行投影里解析目标行：重试匹配 assistantText 行，编辑匹配 userInput 行。
+ * 同文本多条时按 occurrence（1-based，从旧到新）取第 N 条；缺省取最靠近
+ * 尾部的一条。行可能缺 entityId（旧版帧），一律跳过。
+ */
+async function resolveRowTarget(
+  deps: HistoryCommandDeps,
+  tracked: TrackedConversation,
+  kind: "userInput" | "assistantText",
+  text: string,
+  occurrence: number,
+): Promise<{ target: RowTarget; baseRevision: number; baseLogEpoch: string } | string> {
+  const wanted = normalizeText(text);
+  let beforeRowId: number | undefined;
+  let meta: { atRevision: number; atLogEpoch: string } | undefined;
+  const matches: RowTarget[] = [];
+  for (let window = 0; window < ROWS_MAX_WINDOWS; window += 1) {
+    const result = await deps.rawAgentService.conversationRowsRangeV4({
+      workspacePath: deps.workspacePath,
+      sessionId: tracked.sessionId,
+      limit: ROWS_WINDOW_LIMIT,
+      ...(beforeRowId !== undefined ? { beforeRowId } : {}),
+    });
+    meta = { atRevision: result.atRevision, atLogEpoch: result.atLogEpoch };
+    const rows = [...(result.rows ?? [])].sort((a, b) => Number(a.rowId) - Number(b.rowId));
+    for (const row of rows) {
+      if (row.kind !== kind) continue;
+      const entityId = row.entityId;
+      const rowId = Number(row.rowId);
+      if (typeof entityId !== "string" || !entityId || !Number.isFinite(rowId)) continue;
+      const rowText = typeof row.text === "string" ? row.text : "";
+      if (kind === "userInput") {
+        if (normalizeText(rowText) !== wanted) continue;
+      } else if (!normalizeText(rowText).startsWith(wanted)) {
+        continue;
+      }
+      matches.push({ rowId, entityId });
+    }
+    if (matches.length >= occurrence) break;
+    if (!result.hasMore) break;
+    const smallestRowId = rows.length > 0 ? Number(rows[0]?.rowId) : undefined;
+    if (smallestRowId === undefined) break;
+    beforeRowId = smallestRowId;
+  }
+  // matches 按行窗从新到旧收集，翻页拼接后仍偏新。按 rowId 升序重排后取第
+  // occurrence 条（1-based 旧→新）；不存在的序号直接报错，绝不静默取近似行。
+  matches.sort((a, b) => a.rowId - b.rowId);
+  const target = matches[occurrence - 1];
+  if (!target || !meta) {
+    return `在会话行投影中找不到目标${kind === "userInput" ? "提问" : "回复"}（可能超出可操作范围）`;
+  }
+  return { target, baseRevision: meta.atRevision, baseLogEpoch: meta.atLogEpoch };
+}
+
+/**
+ * 编辑/重试入口：POST /api/agent/messages/:messageId/retry 或 /edit。
+ * 命令受理成功后返回与聊天流同格式的 SSE 观察流；受理失败返回 JSON 错误。
+ */
+export async function handleMessageCommand(
+  c: Context,
+  deps: HistoryCommandDeps,
+  args: {
+    mode: "retry" | "edit";
+    newText?: string;
+  },
+): Promise<Response> {
+  const identity = deps.extractIdentity(c.req.raw.headers);
+  if (!identity) {
+    return c.json({ detail: "未登录或缺少身份凭证（需网关注入的 X-User-ID）" }, 401);
+  }
+  const messageId = Number(c.req.param("messageId"));
+  if (!Number.isInteger(messageId) || messageId <= 0) {
+    return c.json({ detail: "messageId 无效" }, 400);
+  }
+  if (args.mode === "edit" && !args.newText?.trim()) {
+    return c.json({ detail: "newText 不能为空" }, 400);
+  }
+  const platformMessage = await fetchPlatformMessage(messageId, identity.userId);
+  if (!platformMessage) {
+    return c.json({ detail: "消息不存在或无法读取" }, 404);
+  }
+  if (args.mode === "retry" && platformMessage.role !== "assistant") {
+    return c.json({ detail: "只能重试助手回复" }, 400);
+  }
+  if (args.mode === "edit" && platformMessage.role !== "user") {
+    return c.json({ detail: "只能编辑用户提问" }, 400);
+  }
+  // 编辑/重试必须作用于进程内活跃的 ZCode 会话（行投影与命令都挂在它上面）。
+  // 服务重启后 tracked 丢失，此时无法定位原 runtime 会话，明确拒绝而不是
+  // 静默改写到一个错误的新会话上。
+  const threadIdentity = await fetchThreadIdentity(platformMessage.conversation_id);
+  if (!threadIdentity) {
+    return c.json({ detail: "会话不存在或无法读取" }, 404);
+  }
+  const tracked = conversationSessionMap.get(`${identity.userId}:${threadIdentity.thread_id}`);
+  if (!tracked) {
+    return c.json({ detail: "服务已重启，这条历史轮次暂不支持编辑/重试；请直接发送新消息" }, 409);
+  }
+  const occurrence = Number(c.req.query("occurrence")) || 1;
+  const kind = args.mode === "edit" ? "userInput" : "assistantText";
+  const resolved = await resolveRowTarget(deps, tracked, kind, platformMessage.content, occurrence);
+  if (typeof resolved === "string") {
+    return c.json({ detail: resolved }, 409);
+  }
+
+  const commandType = args.mode === "edit" ? "editUserQuery" : "retryTurn";
+  const payload =
+    args.mode === "edit"
+      ? {
+          target: resolved.target,
+          newText: args.newText ?? "",
+          // 官方缺省即 preserve：只切 conversation 分支，rewind 先安全恢复该轮文件
+          workspaceMode: "preserve",
+        }
+      : { target: resolved.target };
+  const envelope = {
+    ...buildCommandEnvelope(commandType, payload, tracked.sessionId),
+    // 行定位命令是 CAS 命令：水位取行查询时刻，防止对过期投影执行 rewind
+    baseRevision: resolved.baseRevision,
+    baseLogEpoch: resolved.baseLogEpoch,
+  };
+  const ack = await deps.rawAgentService
+    .sendConversationCommandV4({ workspacePath: deps.workspacePath, envelope })
+    .catch((error) => {
+      return {
+        status: "failed",
+        message: error instanceof Error ? error.message : String(error),
+      };
+    });
+  const ackResult = isCommandAckOk(ack);
+  if (!ackResult.ok) {
+    return c.json({ detail: `命令未受理：${ackResult.error ?? "未知原因"}` }, 409);
+  }
+
+  // runtime 已受理 rewind：平台消息表按同一边界截断（编辑从原提问起、
+  // 重试从原回复起），经串行链执行，先于命令轮收尾落库完成
+  const conversationId = tracked.conversationId;
+  if (conversationId !== undefined) {
+    void enqueueConversationWrite(conversationId, () =>
+      truncateFromMessage(conversationId, messageId, identity.userId),
+    );
+  }
+
+  const runId = `run_${Date.now()}`;
+  return streamSSE(c, async (stream) => {
+    const cleanupFns: Array<() => void> = [];
+    try {
+      let settled = false;
+      let writeChain: Promise<void> = Promise.resolve();
+      const finishSignal = { resolve: () => {} };
+      const finished = new Promise<void>((resolve) => {
+        finishSignal.resolve = resolve;
+      });
+      const emittedToolCalls = new Set<string | undefined>();
+      const registeredToolNames = new Map<string | undefined, string>();
+      let finalDoneEvent: Record<string, unknown> | undefined;
+      const recordedBlocks: Array<Record<string, unknown>> = [];
+      const accumulator: StreamAccumulator = {
+        assistantText: "",
+        truncated: false,
+        stickyTruncated: false,
+        queuedDeltaBytes: 0,
+      };
+      const runWriter = createRunSnapshotWriter({
+        conversationId: tracked.conversationId,
+        runId,
+        userId: identity.userId,
+        getBlocks: () => recordedBlocks,
+      });
+
+      const writeEvent = (payload: unknown, isDelta = false): void => {
+        if (settled) return;
+        let serialized: string | undefined;
+        if (isDelta) {
+          if (
+            accumulator.stickyTruncated ||
+            accumulator.queuedDeltaBytes > MAX_QUEUED_DELTA_BYTES
+          ) {
+            if (!accumulator.stickyTruncated) {
+              accumulator.stickyTruncated = true;
+              accumulator.truncated = true;
+              writeChain = writeChain
+                .then(() =>
+                  stream.writeSSE({
+                    data: JSON.stringify({
+                      type: "message_delta",
+                      content: "\n\n[回答过长，输出已截断；可收窄问题范围后重试]",
+                    }),
+                  }),
+                )
+                .catch(() => {});
+            }
+            return;
+          }
+          serialized = JSON.stringify(payload);
+          accumulator.queuedDeltaBytes += Buffer.byteLength(serialized, "utf8");
+        }
+        const text = serialized ?? JSON.stringify(payload);
+        writeChain = writeChain
+          .then(() => stream.writeSSE({ data: text }))
+          .catch(() => {})
+          .then(() => {
+            if (isDelta && serialized) {
+              accumulator.queuedDeltaBytes -= Buffer.byteLength(serialized, "utf8");
+            }
+          });
+      };
+      const writeFinalEvent = (payload: unknown): void => {
+        writeChain = writeChain
+          .then(() => stream.writeSSE({ data: JSON.stringify(payload) }))
+          .catch(() => {});
+      };
+      const heartbeat = setInterval(() => {
+        if (!settled) void stream.write(": ping\n\n").catch(() => {});
+      }, HEARTBEAT_INTERVAL_MS);
+      cleanupFns.push(() => clearInterval(heartbeat));
+      cleanupFns.push(() => {
+        try {
+          unsubscribe.dispose?.();
+        } catch {}
+      });
+
+      const finishTurn = (): void => {
+        if (settled) return;
+        finalDoneEvent = {
+          type: "done",
+          run_id: runId,
+          truncated: accumulator.truncated,
+        };
+        settled = true;
+        finishSignal.resolve();
+      };
+
+      const subscribe = deps.rawAgentService.onDynamicSessionEvent({
+        workspacePath: deps.workspacePath,
+        sessionId: tracked.sessionId,
+        deliveryKind: "web-remote-replayable",
+      });
+      const unsubscribe = subscribe((serviceEvent) => {
+        try {
+          if (serviceEvent.type === "session.event") {
+            const probe = serviceEvent.event as { eventId?: unknown; type?: unknown } | undefined;
+            if (!probe || typeof probe.type !== "string") return;
+            if (!consumeSessionEventId(probe.eventId)) return;
+          }
+          const handled = handlePermissionRequestedEvent({
+            serviceEvent,
+            userId: identity.userId,
+            sessionId: tracked.sessionId,
+            workspacePath: deps.workspacePath,
+            runId,
+            executionId: undefined,
+            resolve: (permission: PendingPermission, wantAllow: boolean) =>
+              resolvePermissionWith(
+                { workspacePath: deps.workspacePath, rawAgentService: deps.rawAgentService },
+                permission,
+                wantAllow,
+              ),
+            hooks: {
+              writeEvent,
+              setFinalDone: (done) => {
+                finalDoneEvent = done;
+              },
+              // 命令轮的审批挂起同样终态化本流：前端以 interrupt 事件弹出
+              // 卡片，用户的选择随后经既有 resume 路径回传
+              suspendStream: (permission: PendingPermission) => {
+                if (pendingPermissions.has(permission.requestId)) return;
+                pendingPermissions.set(permission.requestId, permission);
+                const expiryTimer = setTimeout(() => {
+                  if (pendingPermissions.delete(permission.requestId)) {
+                    void resolvePermissionWith(
+                      {
+                        workspacePath: deps.workspacePath,
+                        rawAgentService: deps.rawAgentService,
+                      },
+                      permission,
+                      false,
+                    ).catch(() => {});
+                  }
+                }, 10 * 60_000);
+                expiryTimer.unref?.();
+                finishTurn();
+              },
+              onAutoApproveError: (toolName: string, error?: string) => {
+                writeEvent(
+                  {
+                    type: "error",
+                    message: `只读工具 ${toolName} 自动放行失败：${error ?? "未知错误"}`,
+                    error: error ?? "auto-approve failed",
+                    run_id: runId,
+                  },
+                  false,
+                );
+              },
+            },
+          });
+          if (handled) {
+            runWriter.markDirty();
+            return;
+          }
+          if (serviceEvent.type !== "session.event") return;
+          const event = serviceEvent.event as
+            | { type: string; payload?: Record<string, unknown>; eventId?: unknown }
+            | undefined;
+          if (!event) return;
+          if (
+            handleSessionEvent({
+              event,
+              accumulator,
+              runId,
+              recordedBlocks,
+              emittedToolCalls,
+              registeredToolNames,
+              writeEvent,
+            })
+          ) {
+            runWriter.markDirty();
+            return;
+          }
+          if (event.type === "turn.completed" || event.type === "turn.failed") {
+            if (event.type === "turn.failed") {
+              const failure = (event.payload ?? {}) as { error?: { message?: string } };
+              const failureMessage = failure.error?.message ?? "本轮执行失败";
+              recordedBlocks.push({
+                type: "text",
+                content: `本轮执行失败：${failureMessage}`,
+              });
+              runWriter.markDirty();
+              writeEvent(
+                {
+                  type: "error",
+                  message: failureMessage,
+                  error: failure.error?.message ?? "turn_failed",
+                  run_id: runId,
+                },
+                false,
+              );
+            }
+            finishTurn();
+          }
+        } catch {
+          // 单条事件处理失败不中断整个流
+        }
+      });
+
+      await finished;
+      if (conversationId !== undefined) {
+        await awaitTurnPersist(
+          persistTurnResult({
+            conversationId,
+            // 重试沿用原提问（截断保留了用户消息），编辑的旧提问已被截断、
+            // 新提问随本轮落库；两轮都需要重新写入用户消息的只有编辑
+            isResume: args.mode === "retry",
+            message: args.mode === "edit" ? (args.newText ?? "") : "",
+            assistantText: accumulator.assistantText,
+            recordedBlocks,
+          }),
+        );
+      }
+      await runWriter.finish();
+      if (!settled || finalDoneEvent) {
+        if (finalDoneEvent) writeFinalEvent(finalDoneEvent);
+      }
+      await Promise.race([
+        writeChain,
+        new Promise((resolve) => {
+          const flushTimer = setTimeout(resolve, 5_000);
+          flushTimer.unref?.();
+        }),
+      ]);
+    } finally {
+      for (const cleanup of cleanupFns) {
+        try {
+          cleanup();
+        } catch {}
+      }
+    }
+  });
+}
+
+/**
+ * 挂载编辑/重试路由：兼顾带 /agent 网关前缀与不带前缀两种路径，
+ * 与聊天流的注册惯例一致。编辑的新文本在请求体 {newText} 里。
+ */
+export function registerHistoryCommandRoutes(app: Hono, deps: HistoryCommandDeps): void {
+  for (const prefix of ["/api/agent", "/agent/api/agent"]) {
+    app.post(`${prefix}/messages/:messageId/retry`, (c) =>
+      handleMessageCommand(c, deps, { mode: "retry" }),
+    );
+    app.post(`${prefix}/messages/:messageId/edit`, async (c) => {
+      const body = await c.req.json().catch(() => null);
+      const newText = typeof body?.newText === "string" ? body.newText : "";
+      if (!newText.trim()) {
+        return c.json({ detail: "newText 不能为空" }, 400);
+      }
+      return handleMessageCommand(c, deps, { mode: "edit", newText });
+    });
+  }
+}

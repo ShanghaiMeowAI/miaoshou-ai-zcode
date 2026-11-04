@@ -43,6 +43,7 @@ import {
   sweepExpiredPendingWith,
 } from "./approval-routes.js";
 import { handleSessionEvent, type StreamAccumulator } from "./chat-stream-events.js";
+import { registerHistoryCommandRoutes } from "./chat-command-ops.js";
 import { createRunSnapshotWriter } from "./chat-run-sync.js";
 import { resolveRequestedModel, switchSessionModel } from "./chat-model-selection.js";
 import {
@@ -778,6 +779,12 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
 
   app.post("/api/agent/chat", handleChat);
   app.post("/agent/api/agent/chat", handleChat);
+
+  registerHistoryCommandRoutes(app, {
+    workspacePath,
+    rawAgentService,
+    extractIdentity: (headers) => extractMiaoshouIdentity(headers as never),
+  });
 
   registerApprovalRoutes(app, { workspacePath, rawAgentService });
 }
