@@ -210,6 +210,10 @@ export function isCommandAckOk(ack: unknown): { ok: boolean; error?: string } {
   return { ok: false, error: `${status}${detail ? `: ${detail}` : ""}` };
 }
 
+/** 桥接层作为 v4 客户端的稳定标识：握手 clientHello 与命令信封必须一致，
+ *  否则连接范围 facade 会以 fault.command.clientMismatch 拒绝命令。 */
+export const BRIDGE_COMMAND_CLIENT_ID = "miaoshou-bridge";
+
 export function buildCommandEnvelope(
   type: CommandEnvelope["type"],
   payload: unknown,
@@ -217,7 +221,7 @@ export function buildCommandEnvelope(
 ): CommandEnvelope {
   return {
     commandId: randomUUID(),
-    clientId: "miaoshou-bridge",
+    clientId: BRIDGE_COMMAND_CLIENT_ID,
     sessionId,
     type,
     payload,

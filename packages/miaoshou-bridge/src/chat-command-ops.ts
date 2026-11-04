@@ -12,6 +12,7 @@ import { streamSSE } from "hono/streaming";
 import { randomUUID } from "node:crypto";
 import { createZCodeAgentConnectionScope } from "@zcode/services";
 import {
+  BRIDGE_COMMAND_CLIENT_ID,
   buildCommandEnvelope,
   conversationSessionMap,
   consumeSessionEventId,
@@ -584,7 +585,7 @@ async function createHandshakenCommandService(
   await scope.service.initializeConversationV4({
     kind: "clientHello",
     protocolVersion: hello.protocolVersion,
-    clientId: `miaoshou-bridge-${randomUUID()}`,
+    clientId: BRIDGE_COMMAND_CLIENT_ID,
     clientKind: "web",
     appVersion: "miaoshou-bridge",
     capabilities: {
