@@ -35,9 +35,19 @@ async function internalPost(path: string, body: unknown): Promise<unknown | unde
       },
       body: JSON.stringify(body),
     });
-    if (!response.ok) return undefined;
+    if (!response.ok) {
+      console.error(
+        `[miaoshou-bridge] 内部回写失败 ${path} HTTP ${response.status}`,
+        (await response.text().catch(() => "")).slice(0, 200),
+      );
+      return undefined;
+    }
     return await response.json();
-  } catch {
+  } catch (error) {
+    console.error(
+      `[miaoshou-bridge] 内部回写请求异常 ${path}`,
+      error instanceof Error ? error.message : String(error),
+    );
     return undefined;
   }
 }
