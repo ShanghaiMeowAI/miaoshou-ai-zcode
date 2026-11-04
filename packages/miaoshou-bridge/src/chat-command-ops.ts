@@ -23,6 +23,7 @@ import { handleSessionEvent, type StreamAccumulator } from "./chat-stream-events
 import { handlePermissionRequestedEvent, resolvePermissionWith } from "./approval-routes.js";
 import { createRunSnapshotWriter } from "./chat-run-sync.js";
 import { awaitTurnPersist, persistTurnResult } from "./chat-persistence.js";
+import type { MiaoshouUserIdentity } from "./index.js";
 
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const MAX_QUEUED_DELTA_BYTES = 512 * 1024;
@@ -60,7 +61,12 @@ interface CommandAgentService {
 export interface HistoryCommandDeps {
   workspacePath: string;
   rawAgentService: CommandAgentService;
-  extractIdentity: (headers: unknown) => { userId: string } | undefined;
+  extractIdentity: (headers: unknown) => MiaoshouUserIdentity | undefined;
+  /** 进程重启后内存映射缺失时，按平台会话表里持久化的运行时标识恢复会话 */
+  recoverTracked?: (params: {
+    identity: MiaoshouUserIdentity;
+    conversation: { id: number; threadId: string; zcodeSessionId?: string };
+  }) => Promise<TrackedConversation | undefined>;
 }
 
 function internalBaseUrl(): string {
@@ -98,7 +104,7 @@ async function fetchPlatformMessage(
 
 async function fetchThreadIdentity(
   conversationId: number,
-): Promise<{ thread_id: string } | undefined> {
+): Promise<{ thread_id: string; zcode_session_id?: string | null } | undefined> {
   const secret = internalSecret();
   if (!secret) return undefined;
   try {
@@ -107,7 +113,10 @@ async function fetchThreadIdentity(
       { signal: AbortSignal.timeout(5000), headers: { "X-Internal-Secret": secret } },
     );
     if (!response.ok) return undefined;
-    return (await response.json()) as { thread_id: string };
+    return (await response.json()) as {
+      thread_id: string;
+      zcode_session_id?: string | null;
+    };
   } catch {
     return undefined;
   }
@@ -241,16 +250,29 @@ export async function handleMessageCommand(
   if (args.mode === "edit" && platformMessage.role !== "user") {
     return c.json({ detail: "只能编辑用户提问" }, 400);
   }
-  // 编辑/重试必须作用于进程内活跃的 ZCode 会话（行投影与命令都挂在它上面）。
-  // 服务重启后 tracked 丢失，此时无法定位原 runtime 会话，明确拒绝而不是
-  // 静默改写到一个错误的新会话上。
+  // 编辑/重试必须作用于活跃的 ZCode 会话（行投影与命令都挂在它上面）。
+  // 进程重启后内存映射丢失，此时按平台会话表里持久化的运行时标识冷恢复
+  // 原会话；恢复不了才明确拒绝，绝不把 rewind 打到错误的新会话上。
   const threadIdentity = await fetchThreadIdentity(platformMessage.conversation_id);
   if (!threadIdentity) {
     return c.json({ detail: "会话不存在或无法读取" }, 404);
   }
-  const tracked = conversationSessionMap.get(`${identity.userId}:${threadIdentity.thread_id}`);
+  const convKey = `${identity.userId}:${threadIdentity.thread_id}`;
+  let tracked = conversationSessionMap.get(convKey);
   if (!tracked) {
-    return c.json({ detail: "服务已重启，这条历史轮次暂不支持编辑/重试；请直接发送新消息" }, 409);
+    tracked = await deps.recoverTracked?.({
+      identity,
+      conversation: {
+        id: platformMessage.conversation_id,
+        threadId: threadIdentity.thread_id,
+        ...(threadIdentity.zcode_session_id
+          ? { zcodeSessionId: threadIdentity.zcode_session_id }
+          : {}),
+      },
+    });
+  }
+  if (!tracked) {
+    return c.json({ detail: "该会话的历史轮次无法恢复（运行时未保留），请直接发送新消息" }, 409);
   }
   const occurrence = Number(c.req.query("occurrence")) || 1;
   const kind = args.mode === "edit" ? "userInput" : "assistantText";

@@ -47,7 +47,7 @@ function makeDeps(overrides?: Partial<HistoryCommandDeps>): {
   let eventHandler: ((event: Record<string, unknown>) => void) | undefined;
   const deps: HistoryCommandDeps = {
     workspacePath: "/tmp/ws",
-    extractIdentity: () => ({ userId: "42" }),
+    extractIdentity: () => ({ userId: "42", role: "user" }),
     rawAgentService: {
       sendConversationCommandV4: vi.fn(async ({ envelope }: any) => {
         commandCalls.push(envelope);
@@ -219,6 +219,65 @@ describe("chat history commands", () => {
     expect(response.status).toBe(409);
     const detail = (await response.json()) as { detail: string };
     expect(detail.detail).toContain("revisionConflict");
+  });
+
+  it("映射丢失时按平台持久化的运行时标识恢复会话后再发命令", async () => {
+    conversationSessionMap.delete("42:sess-1");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: unknown) => {
+        const url = String(input);
+        if (url.includes("/internal/bridge/messages/123?")) {
+          return new Response(
+            JSON.stringify({
+              id: 123,
+              conversation_id: 5,
+              role: "assistant",
+              content: "回测完成：run_id 10811",
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.includes("/internal/bridge/conversations/5")) {
+          return new Response(
+            JSON.stringify({ id: 5, thread_id: "sess-1", zcode_session_id: "sess-restored" }),
+            { status: 200 },
+          );
+        }
+        return new Response("{}", { status: 200 });
+      }),
+    );
+    const recoverTracked = vi.fn(async () => ({
+      userId: "42",
+      sessionId: "sess-restored",
+      lastUsedAt: Date.now(),
+      conversationId: 5,
+    }));
+    const { deps, commandCalls, hasEventHandler, fireSessionEvent } = makeDeps({ recoverTracked });
+    const promise = handleMessageCommand(jsonContext("123"), deps, { mode: "retry" });
+    await vi.waitFor(() => expect(hasEventHandler()).toBe(true));
+    fireSessionEvent({
+      type: "turn.completed",
+      eventId: globalThis.crypto.randomUUID(),
+    });
+    const response = await promise;
+    expect(response.status).toBe(200);
+    expect(recoverTracked).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversation: expect.objectContaining({ id: 5, zcodeSessionId: "sess-restored" }),
+      }),
+    );
+    expect(commandCalls[0]!.sessionId).toBe("sess-restored");
+  });
+
+  it("没有持久化标识且内存映射缺失时明确拒绝而不是改写新会话", async () => {
+    conversationSessionMap.delete("42:sess-1");
+    const { deps, commandCalls } = makeDeps();
+    const response = await handleMessageCommand(jsonContext("123"), deps, { mode: "retry" });
+    expect(response.status).toBe(409);
+    expect(commandCalls).toHaveLength(0);
+    const detail = (await response.json()) as { detail: string };
+    expect(detail.detail).toContain("无法恢复");
   });
 
   it("编辑命令带 newText 且校验角色", async () => {

@@ -6,7 +6,6 @@ import {
   clearSessionOwner,
   extractMiaoshouIdentity,
   registerSessionOwner,
-  sweepSessionOwners,
 } from "./index.js";
 
 import {
@@ -17,14 +16,10 @@ import {
   MAX_RUNS_PER_USER,
   MAX_TRACKED_PER_USER,
   PENDING_PERMISSION_TTL_MS,
-  SESSION_IDLE_SWEEP_INTERVAL_MS,
-  SESSION_IDLE_TTL_MS,
   SESSION_TOOL_DENYLIST,
-  STREAM_TIMEOUT_MS,
   consumeSessionEventId,
   conversationSessionMap,
   createProjectIdResolver,
-  dropDeniedToolResults,
   eventToolName,
   pendingPermissions,
   occupyStreamSlot,
@@ -34,6 +29,7 @@ import {
   runRegistry,
   type PendingPermission,
 } from "./chat-shared.js";
+import { startSessionIdleSweep } from "./chat-idle-sweep.js";
 import { registerChatGuard } from "./chat-registration.js";
 import {
   handlePermissionRequestedEvent,
@@ -52,7 +48,11 @@ import {
   persistTurnResult,
   replayDeniedToolResults,
 } from "./chat-persistence.js";
-import { resolveBridgeConversation } from "./bridge-internal-client.js";
+import {
+  resolveBridgeConversation,
+  saveBridgeConversationSession,
+} from "./bridge-internal-client.js";
+import { recoverTrackedConversation, createTrackedRecovery } from "./chat-session-recovery.js";
 
 export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollection): void {
   const workspacePath = process.env.ZCODE_SERVER_WORKSPACE?.trim() || DEFAULT_WORKSPACE_PATH;
@@ -76,30 +76,13 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
   const liveStreamSessions = new Set<string>();
 
   // 会话空闲清扫：长期未用的会话显式关闭，防止映射与运行时随用户数无界累积；
-  // 有在途流的会话跳过；顺带回收过期的运行登记（端点批准后无人观察的执行）
-  // 与归属登记（经 /ws 通道登记后无人清理的条目按 24 小时闲置淘汰）
-  const idleSweep = setInterval(() => {
-    const now = Date.now();
-    for (const [key, tracked] of conversationSessionMap) {
-      if (now - tracked.lastUsedAt <= SESSION_IDLE_TTL_MS) continue;
-      if (liveStreamSessions.has(tracked.sessionId)) continue;
-      conversationSessionMap.delete(key);
-      clearSessionOwner(tracked.sessionId);
-      dropDeniedToolResults(tracked.sessionId);
-      void rawAgentService
-        .closeSession({ workspacePath, sessionId: tracked.sessionId })
-        .catch(() => {});
-    }
-    for (const [key, tracked] of runRegistry) {
-      if (now - tracked.lastUsedAt <= STREAM_TIMEOUT_MS) continue;
-      if (liveStreamSessions.has(tracked.sessionId)) continue;
-      runRegistry.delete(key);
-      runExecutionRegistry.delete(key);
-    }
-    sweepSessionOwners();
-    sweepExpiredPending();
-  }, SESSION_IDLE_SWEEP_INTERVAL_MS);
-  idleSweep.unref?.();
+  // 有在途流的会话跳过；顺带回收过期的运行登记与归属登记
+  startSessionIdleSweep({
+    rawAgentService,
+    workspacePath,
+    liveStreamSessions,
+    sweepExpiredPending,
+  });
 
   /**
    * 确保工作区拥有 projectId（ZCode Server 远程客户端创建会话必需）。
@@ -172,6 +155,18 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
         : String(Date.now());
     const convKey = `${identity.userId}:${clientConvId}`;
     let tracked = conversationSessionMap.get(convKey);
+
+    // 服务重启后内存映射丢失：平台会话表持久化了运行时标识时，冷恢复原会话，
+    // 续聊不丢上下文，后续编辑/重试也还能定位到原来的行投影
+    if (!tracked && bridgeConversation?.zcodeSessionId) {
+      tracked = await recoverTrackedConversation({
+        rawAgentService,
+        workspacePath,
+        quantServerTemplate,
+        identity,
+        conversation: bridgeConversation,
+      });
+    }
 
     // 兼容旧前端的中断恢复契约：审批选项以 resume 字段随下一条消息回传。
     // 解析逻辑拆在 approval-routes（parsePendingResume）；回执动作延迟到
@@ -258,6 +253,14 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
         });
         sessionId = snapshot.session.sessionId;
         registerSessionOwner(sessionId, identity.userId);
+        // 运行时标识持久化到平台会话表：桥接层重启后恢复会话的唯一依据
+        if (bridgeConversation) {
+          await saveBridgeConversationSession(
+            bridgeConversation.id,
+            Number(identity.userId),
+            sessionId,
+          );
+        }
         // 新会话立即切到请求的模型(setModel 对象入口保留档位;
         // runtime 默认模型不可控,不切则新会话可能无模型直接失败)
         if (requestedModel) {
@@ -784,6 +787,7 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
     workspacePath,
     rawAgentService,
     extractIdentity: (headers) => extractMiaoshouIdentity(headers as never),
+    recoverTracked: createTrackedRecovery({ rawAgentService, workspacePath, quantServerTemplate }),
   });
 
   registerApprovalRoutes(app, { workspacePath, rawAgentService });

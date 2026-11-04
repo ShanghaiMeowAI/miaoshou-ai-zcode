@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeAll } from "vitest";
+import { describe, expect, it, beforeAll, vi } from "vitest";
 import { Hono } from "hono";
 import { registerMiaoshouChatRoutes } from "./chat-stream-route.js";
 import { fakeServices, withEnv } from "./chat-test-support.js";
@@ -122,6 +122,72 @@ describe("registerMiaoshouChatRoutes 注册守卫", () => {
       // 非法提交不清空挂起审批，用户仍可提交合法回执
       expect(pendingPermissions.has("req-bad")).toBe(true);
       pendingPermissions.clear();
+    });
+  });
+
+  it("重启后按平台持久化的运行时标识恢复会话而不是新建", async () => {
+    await withEnv({ ZCODE_SERVER_AUTH_TOKEN: "t", QUANT_MCP_INTERNAL_SECRET: "s" }, async () => {
+      const { conversationSessionMap } = await import("./chat-shared.js");
+      conversationSessionMap.clear();
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: unknown) => {
+          const url = String(input);
+          if (url.includes("/internal/bridge/conversations/77")) {
+            return new Response(
+              JSON.stringify({ id: 77, thread_id: "t77", zcode_session_id: "sess_old" }),
+              { status: 200 },
+            );
+          }
+          return new Response("{}", { status: 200 });
+        }),
+      );
+      const resumeSession = vi.fn(async () => ({ session: { sessionId: "sess_old" } }));
+      const createSession = vi.fn(async () => ({ session: { sessionId: "sess_new" } }));
+      const services = {
+        get: () => ({
+          onDynamicSessionEvent:
+            () =>
+            (cb: (event: unknown) => void): { dispose: () => void } => {
+              queueMicrotask(() =>
+                cb({
+                  type: "session.event",
+                  event: { type: "turn.completed", payload: { resultType: "success" } },
+                }),
+              );
+              return { dispose: () => {} };
+            },
+          sendConversationCommandV4: async () => ({ status: "accepted" }),
+          closeSession: async () => true,
+          createSession,
+          resumeSession,
+          sendPrompt: async () => ({ ok: true }),
+        }),
+        getOptional: () => undefined,
+      } as unknown as Parameters<typeof registerMiaoshouChatRoutes>[1];
+      try {
+        const app = new Hono();
+        registerMiaoshouChatRoutes(app, services);
+        const response = await app.request("/api/agent/chat", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-platform-token": "t",
+            "x-user-id": "42",
+            "x-user-role": "user",
+          },
+          body: JSON.stringify({ message: "继续", conversation_id: 77 }),
+        });
+        expect(response.status).toBe(200);
+        expect(resumeSession).toHaveBeenCalledWith(
+          expect.objectContaining({ sessionId: "sess_old" }),
+        );
+        expect(createSession).not.toHaveBeenCalled();
+        await response.text();
+      } finally {
+        conversationSessionMap.clear();
+        vi.unstubAllGlobals();
+      }
     });
   });
 
