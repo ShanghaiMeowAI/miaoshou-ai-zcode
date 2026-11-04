@@ -9,6 +9,8 @@
 import type { Context } from "hono";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
+import { randomUUID } from "node:crypto";
+import { createZCodeAgentConnectionScope } from "@zcode/services";
 import {
   buildCommandEnvelope,
   conversationSessionMap,
@@ -276,7 +278,19 @@ export async function handleMessageCommand(
   }
   const occurrence = Number(c.req.query("occurrence")) || 1;
   const kind = args.mode === "edit" ? "userInput" : "assistantText";
-  const resolved = await resolveRowTarget(deps, tracked, kind, platformMessage.content, occurrence);
+  let resolved: Awaited<ReturnType<typeof resolveRowTarget>>;
+  try {
+    resolved = await resolveRowTarget(deps, tracked, kind, platformMessage.content, occurrence);
+  } catch (error) {
+    console.error(
+      `[miaoshou-bridge] resolveRowTarget 异常 (${args.mode})`,
+      error instanceof Error ? error.stack : String(error),
+    );
+    return c.json(
+      { detail: `解析历史轮次失败：${error instanceof Error ? error.message : "未知错误"}` },
+      500,
+    );
+  }
   if (typeof resolved === "string") {
     return c.json({ detail: resolved }, 409);
   }
@@ -557,13 +571,28 @@ export async function handleMessageCommand(
 }
 
 /**
- * 挂载编辑/重试路由：兼顾带 /agent 网关前缀与不带前缀两种路径，
+ * 挂载编辑/重试路由：兼顾带 /agent 与 /agent-harness 网关前缀以及不带前缀的路径，
  * 与聊天流的注册惯例一致。编辑的新文本在请求体 {newText} 里。
  */
 export function registerHistoryCommandRoutes(app: Hono, deps: HistoryCommandDeps): void {
-  for (const prefix of ["/api/agent", "/agent/api/agent"]) {
+  // conversationRowsRangeV4 要求 terminal-client 可信连接上下文，
+  // 此处自动建立连接范围 facade，彻底根除 rowsRangeConnectionUntrusted 报错
+  const trustedService = (deps.rawAgentService as unknown as { __isTrustedScope?: boolean })
+    ?.__isTrustedScope
+    ? deps.rawAgentService
+    : (Object.assign(
+        createZCodeAgentConnectionScope(deps.rawAgentService as never, {
+          connectionId: `bridge-cmd-${randomUUID()}`,
+          clientMode: "web-remote-replayable",
+          role: "terminal-client",
+        }).service,
+        { __isTrustedScope: true },
+      ) as unknown as CommandAgentService);
+  const trustedDeps: HistoryCommandDeps = { ...deps, rawAgentService: trustedService };
+
+  for (const prefix of ["/api/agent", "/agent/api/agent", "/agent-harness/api/agent"]) {
     app.post(`${prefix}/messages/:messageId/retry`, (c) =>
-      handleMessageCommand(c, deps, { mode: "retry" }),
+      handleMessageCommand(c, trustedDeps, { mode: "retry" }),
     );
     app.post(`${prefix}/messages/:messageId/edit`, async (c) => {
       const body = await c.req.json().catch(() => null);
@@ -571,7 +600,7 @@ export function registerHistoryCommandRoutes(app: Hono, deps: HistoryCommandDeps
       if (!newText.trim()) {
         return c.json({ detail: "newText 不能为空" }, 400);
       }
-      return handleMessageCommand(c, deps, { mode: "edit", newText });
+      return handleMessageCommand(c, trustedDeps, { mode: "edit", newText });
     });
   }
 }

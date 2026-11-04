@@ -342,8 +342,6 @@ export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
       note: "批准已提交；执行结果请回到会话流查看",
     });
   };
-  app.post("/api/agent/interrupts/:interruptId", handleInterrupt);
-  app.post("/agent/api/agent/interrupts/:interruptId", handleInterrupt);
 
   // ── 取消执行：POST /api/agent/runs/:runId/cancel ──────────────────────
   const handleCancel = async (c: any) => {
@@ -373,8 +371,6 @@ export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
       return c.json({ detail: error instanceof Error ? error.message : "取消失败" }, 500);
     }
   };
-  app.post("/api/agent/runs/:runId/cancel", handleCancel);
-  app.post("/agent/api/agent/runs/:runId/cancel", handleCancel);
 
   // ── 状态记录（旧前端契约保留）：POST /api/agent/conversations/:id/runs/:runId/interrupted
   const handleInterrupted = (c: any) => {
@@ -383,6 +379,10 @@ export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
       note: "状态已记录；停止执行请调用 cancel 接口",
     });
   };
-  app.post("/api/agent/conversations/:id/runs/:runId/interrupted", handleInterrupted);
-  app.post("/agent/api/agent/conversations/:id/runs/:runId/interrupted", handleInterrupted);
+
+  for (const prefix of ["/api/agent", "/agent/api/agent", "/agent-harness/api/agent"]) {
+    app.post(`${prefix}/interrupts/:interruptId`, handleInterrupt);
+    app.post(`${prefix}/runs/:runId/cancel`, handleCancel);
+    app.post(`${prefix}/conversations/:id/runs/:runId/interrupted`, handleInterrupted);
+  }
 }

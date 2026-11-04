@@ -780,8 +780,9 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
     });
   };
 
-  app.post("/api/agent/chat", handleChat);
-  app.post("/agent/api/agent/chat", handleChat);
+  for (const prefix of ["/api/agent", "/agent/api/agent", "/agent-harness/api/agent"]) {
+    app.post(`${prefix}/chat`, handleChat);
+  }
 
   registerHistoryCommandRoutes(app, {
     workspacePath,
