@@ -44,11 +44,7 @@ import {
 } from "./approval-routes.js";
 import { handleSessionEvent, type StreamAccumulator } from "./chat-stream-events.js";
 import { createRunSnapshotWriter } from "./chat-run-sync.js";
-import {
-  createSessionWithModelFallback,
-  resolveRequestedModel,
-  switchSessionModel,
-} from "./chat-model-selection.js";
+import { resolveRequestedModel, switchSessionModel } from "./chat-model-selection.js";
 import {
   awaitTurnPersist,
   persistResumeUserAction,
@@ -137,10 +133,7 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
       typeof body.run_id === "string" && body.run_id ? body.run_id : `run_${Date.now()}`;
     // 前端选中的供应商模型标识（如 deepseek-v4-pro）：命中已启用清单就用它；
     // 未命中回退清单第一个模型并记日志（新会话没有模型会立即失败）
-    const resolvedModel = resolveRequestedModel(
-      body.model_id,
-      body.reasoning_effort,
-    );
+    const resolvedModel = resolveRequestedModel(body.model_id, body.reasoning_effort);
     const requestedModel = resolvedModel?.selection;
     if (resolvedModel && !resolvedModel.matched) {
       console.error(
@@ -251,20 +244,28 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
         // 注意不能用 toolAllowlist:[]——它是全局白名单，会连量化 MCP 工具一起
         // 过滤掉（registerMcpTools 对空集合全跳过）；内置工具收口完全由
         // SESSION_TOOL_DENYLIST 黑名单承担（已覆盖 ReadSessionContext 等免审批工具）
-        const createParams = {
+        // 模型不放进 session/create:上游 runtime 会把它转成字符串丢档位
+        // ("Reasoning level is required")。官方 UI 切模型走 setModel 对象入口
+        // (保留档位),这里创建后立即切换,同一无档位丢失路径。
+        const snapshot = await rawAgentService.createSession({
           workspacePath,
           projectId,
-          mode: "build" as const,
+          mode: "build",
           toolDenylist: SESSION_TOOL_DENYLIST,
           mcpServers:
             applyIdentityToMcpServers([structuredClone(quantServerTemplate)], identity) ?? [],
-        };
-        const snapshot = await createSessionWithModelFallback({
-          create: (extra) => rawAgentService.createSession({ ...createParams, ...extra }),
-          requestedModel,
         });
         sessionId = snapshot.session.sessionId;
         registerSessionOwner(sessionId, identity.userId);
+        // 新会话立即切到请求的模型(setModel 对象入口保留档位;
+        // runtime 默认模型不可控,不切则新会话可能无模型直接失败)
+        if (requestedModel) {
+          await rawAgentService.setModel({
+            workspacePath,
+            sessionId,
+            model: requestedModel,
+          });
+        }
         tracked = {
           userId: identity.userId,
           sessionId,
