@@ -570,37 +570,77 @@ export async function handleMessageCommand(
   });
 }
 
+async function createHandshakenCommandService(
+  base: CommandAgentService,
+): Promise<CommandAgentService> {
+  const scope = createZCodeAgentConnectionScope(base as never, {
+    connectionId: `bridge-cmd-${randomUUID()}`,
+    clientMode: "web-remote-replayable",
+    role: "terminal-client",
+  });
+  // terminal-client 连接必须先 hello → clientHello 才允许 v4 调用（rowsRange 等），
+  // 只建 scope 不握手会被 assertReady 以 handshakeRequired 拒绝
+  const hello = await scope.service.helloConversationV4();
+  await scope.service.initializeConversationV4({
+    kind: "clientHello",
+    protocolVersion: hello.protocolVersion,
+    clientId: `miaoshou-bridge-${randomUUID()}`,
+    clientKind: "web",
+    appVersion: "miaoshou-bridge",
+    capabilities: {
+      ...(hello.capabilities?.workflowRunDeltas === true ? { workflowRunDeltas: true } : {}),
+      ...(hello.capabilities?.historyFirst === true ? { historyFirst: true } : {}),
+    },
+  });
+  return scope.service as unknown as CommandAgentService;
+}
+
 /**
  * 挂载编辑/重试路由：兼顾带 /agent 与 /agent-harness 网关前缀以及不带前缀的路径，
  * 与聊天流的注册惯例一致。编辑的新文本在请求体 {newText} 里。
  */
 export function registerHistoryCommandRoutes(app: Hono, deps: HistoryCommandDeps): void {
-  // conversationRowsRangeV4 要求 terminal-client 可信连接上下文，
-  // 此处自动建立连接范围 facade，彻底根除 rowsRangeConnectionUntrusted 报错
-  const trustedService = (deps.rawAgentService as unknown as { __isTrustedScope?: boolean })
-    ?.__isTrustedScope
-    ? deps.rawAgentService
-    : (Object.assign(
-        createZCodeAgentConnectionScope(deps.rawAgentService as never, {
-          connectionId: `bridge-cmd-${randomUUID()}`,
-          clientMode: "web-remote-replayable",
-          role: "terminal-client",
-        }).service,
-        { __isTrustedScope: true },
-      ) as unknown as CommandAgentService);
-  const trustedDeps: HistoryCommandDeps = { ...deps, rawAgentService: trustedService };
+  // 复用一条已握手的可信连接：建链失败时清掉缓存，下一次请求重新握手
+  let trusted: Promise<CommandAgentService> | undefined;
+  const ensureTrusted = (): Promise<CommandAgentService> => {
+    if (!trusted) {
+      trusted = createHandshakenCommandService(deps.rawAgentService).catch((error) => {
+        trusted = undefined;
+        throw error;
+      });
+    }
+    return trusted;
+  };
+
+  const runCommand = async (
+    c: Context,
+    args: { mode: "retry" | "edit"; newText?: string },
+  ): Promise<Response> => {
+    let service: CommandAgentService;
+    try {
+      service = await ensureTrusted();
+    } catch (error) {
+      console.error(
+        "[miaoshou-bridge] 历史命令连接握手失败",
+        error instanceof Error ? error.stack : String(error),
+      );
+      return c.json(
+        { detail: `连接握手失败：${error instanceof Error ? error.message : "未知错误"}` },
+        500,
+      );
+    }
+    return handleMessageCommand(c, { ...deps, rawAgentService: service }, args);
+  };
 
   for (const prefix of ["/api/agent", "/agent/api/agent", "/agent-harness/api/agent"]) {
-    app.post(`${prefix}/messages/:messageId/retry`, (c) =>
-      handleMessageCommand(c, trustedDeps, { mode: "retry" }),
-    );
+    app.post(`${prefix}/messages/:messageId/retry`, (c) => runCommand(c, { mode: "retry" }));
     app.post(`${prefix}/messages/:messageId/edit`, async (c) => {
       const body = await c.req.json().catch(() => null);
       const newText = typeof body?.newText === "string" ? body.newText : "";
       if (!newText.trim()) {
         return c.json({ detail: "newText 不能为空" }, 400);
       }
-      return handleMessageCommand(c, trustedDeps, { mode: "edit", newText });
+      return runCommand(c, { mode: "edit", newText });
     });
   }
 }
