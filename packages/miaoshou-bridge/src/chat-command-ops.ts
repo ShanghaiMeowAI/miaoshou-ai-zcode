@@ -190,6 +190,9 @@ async function resolveRowTarget(
   let beforeRowId: number | undefined;
   let meta: { atRevision: number; atLogEpoch: string } | undefined;
   const matches: Array<RowTarget & { actionable: boolean; hasActions: boolean; diag: string }> = [];
+  // 取证采样：尾部最新助手行与全窗口带动作标记的行，用于确认 canRetry 挂在哪一行
+  let tailAssistantDiag: string | undefined;
+  const actionRowsDiag: string[] = [];
   // 失败诊断采样：恢复后的投影若整体缺 actions（hydration 未重建动作标记），
   // 或 canRetry 不在候选行上，需要原始行摘要才能区分，避免继续盲猜
   let rowsSeen = 0;
@@ -205,7 +208,19 @@ async function resolveRowTarget(
     const rows = [...(result.rows ?? [])].sort((a, b) => Number(a.rowId) - Number(b.rowId));
     for (const row of rows) {
       rowsSeen += 1;
-      if (row.actions !== undefined) rowsWithActions += 1;
+      if (row.actions !== undefined) {
+        rowsWithActions += 1;
+        if (actionRowsDiag.length < 5) {
+          actionRowsDiag.push(
+            `#${Number(row.rowId)} kind=${String(row.kind)} state=${String(row.state)} actions=${JSON.stringify(row.actions)}`,
+          );
+        }
+      }
+      if (row.kind === "assistantText") {
+        const tailHead =
+          typeof row.text === "string" ? row.text.replace(/\s+/g, " ").trim().slice(0, 24) : "";
+        tailAssistantDiag = `#${Number(row.rowId)} state=${String(row.state)} actions=${JSON.stringify(row.actions ?? null)} head=${tailHead}`;
+      }
       if (row.kind !== kind) continue;
       const entityId = row.entityId;
       const rowId = Number(row.rowId);
@@ -268,7 +283,7 @@ async function resolveRowTarget(
     // 命中即落行摘要：冷恢复后动作标记/状态是否被重建、守卫为何仍拒绝，
     // 都靠这行原始数据区分（只有重试/编辑这类人工操作会触发，量很小）
     console.warn(
-      `[miaoshou-bridge] 行解析命中 kind=${kind} rowsSeen=${rowsSeen} rowsWithActions=${rowsWithActions} candidates=${matches.length} actionable=${actionableMatches.length} chosen=${target.diag}`,
+      `[miaoshou-bridge] 行解析命中 kind=${kind} rowsSeen=${rowsSeen} rowsWithActions=${rowsWithActions} candidates=${matches.length} actionable=${actionableMatches.length} chosen=${target.diag} tailAssistant=${tailAssistantDiag ?? "none"} actionRows=${actionRowsDiag.join(" ; ") || "none"}`,
     );
   }
   if (!target || !meta) {
