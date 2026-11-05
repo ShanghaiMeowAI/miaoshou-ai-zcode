@@ -189,7 +189,11 @@ async function resolveRowTarget(
   const wanted = normalizeText(text);
   let beforeRowId: number | undefined;
   let meta: { atRevision: number; atLogEpoch: string } | undefined;
-  const matches: Array<RowTarget & { actionable: boolean; hasActions: boolean }> = [];
+  const matches: Array<RowTarget & { actionable: boolean; hasActions: boolean; diag: string }> = [];
+  // 失败诊断采样：恢复后的投影若整体缺 actions（hydration 未重建动作标记），
+  // 或 canRetry 不在候选行上，需要原始行摘要才能区分，避免继续盲猜
+  let rowsSeen = 0;
+  let rowsWithActions = 0;
   for (let window = 0; window < ROWS_MAX_WINDOWS; window += 1) {
     const result = await deps.rawAgentService.conversationRowsRangeV4({
       workspacePath: deps.workspacePath,
@@ -200,6 +204,8 @@ async function resolveRowTarget(
     meta = { atRevision: result.atRevision, atLogEpoch: result.atLogEpoch };
     const rows = [...(result.rows ?? [])].sort((a, b) => Number(a.rowId) - Number(b.rowId));
     for (const row of rows) {
+      rowsSeen += 1;
+      if (row.actions !== undefined) rowsWithActions += 1;
       if (row.kind !== kind) continue;
       const entityId = row.entityId;
       const rowId = Number(row.rowId);
@@ -226,7 +232,13 @@ async function resolveRowTarget(
           continue;
         }
       }
-      matches.push({ rowId, entityId, actionable, hasActions: actions !== undefined });
+      matches.push({
+        rowId,
+        entityId,
+        actionable,
+        hasActions: actions !== undefined,
+        diag: `#${rowId} state=${String(row.state)} actions=${JSON.stringify(actions ?? null)} head=${normRow.slice(0, 24)}`,
+      });
     }
     if (matches.filter((item) => item.actionable).length >= occurrence) break;
     if (!result.hasMore) break;
@@ -241,6 +253,11 @@ async function resolveRowTarget(
   // 服务端下发了动作标记却没有任何可操作行：如实报告不可操作，不再让运行时守卫
   // 抛出一句含糊的 actionUnavailable；旧版帧不带 actions 时退回纯文本匹配
   if (actionableMatches.length === 0 && matches.some((item) => item.hasActions)) {
+    console.warn(
+      `[miaoshou-bridge] 行解析无可操作行 kind=${kind} rowsSeen=${rowsSeen} rowsWithActions=${rowsWithActions} candidates=${matches.length} ${matches
+        .map((item) => item.diag)
+        .join(" | ")}`,
+    );
     return kind === "userInput"
       ? "该提问所在轮次已不可编辑（运行时未提供编辑能力）"
       : "该回复所在轮次已不可重试（运行时未提供重试能力）";
@@ -248,6 +265,9 @@ async function resolveRowTarget(
   const pool = actionableMatches.length > 0 ? actionableMatches : matches;
   const target = pool[occurrence - 1];
   if (!target || !meta) {
+    console.warn(
+      `[miaoshou-bridge] 行解析未命中 kind=${kind} rowsSeen=${rowsSeen} rowsWithActions=${rowsWithActions} candidates=${matches.length} wanted=${wanted.slice(0, 24)}`,
+    );
     return `在会话行投影中找不到目标${kind === "userInput" ? "提问" : "回复"}（可能超出可操作范围）`;
   }
   return {
@@ -359,6 +379,10 @@ export async function handleMessageCommand(
     });
   const ackResult = isCommandAckOk(ack);
   if (!ackResult.ok) {
+    // 被拒时把目标行与错误码一并落日志：区分"选错行"与"运行时不允许该行操作"
+    console.warn(
+      `[miaoshou-bridge] 命令被拒 ${commandType} target=${JSON.stringify(resolved.target)} error=${ackResult.error ?? "unknown"}`,
+    );
     return c.json({ detail: `命令未受理：${ackResult.error ?? "未知原因"}` }, 409);
   }
 
