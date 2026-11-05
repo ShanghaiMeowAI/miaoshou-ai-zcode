@@ -81,7 +81,16 @@ bash scripts/deploy-miaoshou.sh
 
 脚本自带：配置前置检查 → 3030 端口占用预检 → 依赖安装与构建 →
 `pm2 startOrReload`（环境经 `.env.production` 注入，密钥不落仓库）→
-healthz 探针（注册 + readiness 全绿才 `pm2 save`）。
+显式 `pm2 restart --update-env`（startOrReload 实测不刷新 PM2 记录的
+环境变量，2026-11-05 事故加固）→ healthz 探针（注册 + readiness 全绿）→
+`/proc/<pid>/environ` 与 `.env.production` 逐行断言，不一致即部署失败。
+
+环境配置的硬性约束（违反即拒绝部署）：
+
+- `.env.production` 任何键不允许出现两行（同名键后行覆盖前行，
+  曾引发工作区路径漂移、历史会话冷恢复失联的故障）；
+- `ZCODE_SERVER_WORKSPACE` 锁定为 `/var/www/miaoshou-ai-zcode/workspace`
+  （任务库历史会话均挂在该工作区键下；确需变更必须先规划任务库迁移）。
 
 GitHub 仓库需配置 Secrets（与 miaoshou-api-agent 仓库同名的三个）：
 `MIAOSHOU_HOST` / `MIAOSHOU_USER` / `MIAOSHOU_SSH_KEY`。

@@ -32,12 +32,34 @@ if [ ! -f "${ENV_FILE}" ]; then
   echo "缺少 ${ENV_FILE}（含 ZCODE_SERVER_AUTH_TOKEN 等生产配置），拒绝部署" >&2
   exit 1
 fi
+
+# 配置防漂移（2026-11-05 事故加固）：.env.production 曾出现同名键两行、
+# 后行覆盖前行，叠加 PM2 reload 不刷新环境变量，导致工作区路径在进程
+# 代际间漂移、历史会话冷恢复全部失联。自此部署强制三道闸：
+# 1) 任何键不允许出现两行；2) 工作区路径锁定规范值（带 /workspace 后缀，
+# 与任务库既有 workspace_key 一致，改动即拒绝）；3) 收尾用 /proc environ
+# 与配置文件逐行比对，不一致即部署失败。要改工作区路径，必须连同任务库
+# 历史会话迁移一起规划，不允许悄悄改配置。
 set -a
 . ./"${ENV_FILE}"
 set +a
 : "${ZCODE_SERVER_AUTH_TOKEN:?ZCODE_SERVER_AUTH_TOKEN 未配置}"
 : "${QUANT_MCP_INTERNAL_SECRET:?QUANT_MCP_INTERNAL_SECRET 未配置}"
 : "${ZCODE_SERVER_WORKSPACE:?ZCODE_SERVER_WORKSPACE 未配置}"
+
+DUPLICATED_KEYS="$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "${ENV_FILE}" | cut -d= -f1 | sort | uniq -d)"
+if [ -n "${DUPLICATED_KEYS}" ]; then
+  echo "${ENV_FILE} 存在重复键（后行覆盖前行，曾引发工作区漂移故障）：" >&2
+  echo "${DUPLICATED_KEYS}" >&2
+  echo "请合并为单行后重试，拒绝部署" >&2
+  exit 1
+fi
+CANONICAL_WORKSPACE=/var/www/miaoshou-ai-zcode/workspace
+if [ "${ZCODE_SERVER_WORKSPACE}" != "${CANONICAL_WORKSPACE}" ]; then
+  echo "ZCODE_SERVER_WORKSPACE 必须为规范值 ${CANONICAL_WORKSPACE}（当前：${ZCODE_SERVER_WORKSPACE}）" >&2
+  echo "历史会话的任务行均挂在该工作区键下，改动会使冷恢复失联；如确需变更请先规划任务库迁移" >&2
+  exit 1
+fi
 
 # 端口预检：3030 被其它进程占用时提前失败。本仓库自身的 node 进程
 # （正常部署时旧实例仍监听,startOrReload 会原位替换）不算占用——
@@ -66,9 +88,12 @@ for pkg in @zcode/shared-types @zcode/dynamic-workflow @zcode/dynamic-workflow-r
 done
 
 mkdir -p workspace
-# 环境经 --update-env 继承本 shell（.env.production 已 export），
-# ecosystem 文件里不落生产密钥
+# 环境确定性生效（2026-11-05 事故加固）：实测 pm2 startOrReload --update-env
+# 不会刷新 PM2 记录的环境变量（fork 模式沿用首启快照），曾导致 .env.production
+# 改动静默不生效。startOrReload 只负责首次拉起与进程替换，随后必须显式
+# restart --update-env 让本 shell（.env.production 已 export）的环境如实注入。
 pm2 startOrReload ecosystem.miaoshou.config.cjs --update-env
+pm2 restart miaoshou-ai-zcode --update-env
 
 # 探针：bridge 必须已注册且 quant 可达（readiness ready）才算发布成功
 for _ in $(seq 1 30); do
@@ -76,12 +101,31 @@ for _ in $(seq 1 30); do
     "http://127.0.0.1:${ZCODE_PORT}/api/agent/healthz" 2>/dev/null || true)"
   if printf '%s' "${BODY}" | grep -q '"bridge":"registered"' && \
      printf '%s' "${BODY}" | grep -q '"readiness":"ready"'; then
-    echo "miaoshou-ai-zcode ready: ${BODY}"
-    pm2 save
-    exit 0
+    break
   fi
   sleep 2
 done
-echo "healthz 探针未就绪，最近日志：" >&2
-pm2 logs miaoshou-ai-zcode --lines 30 --nostream >&2 || true
-exit 1
+if [ -z "${BODY:-}" ] || ! printf '%s' "${BODY}" | grep -q '"readiness":"ready"'; then
+  echo "healthz 探针未就绪，最近日志：" >&2
+  pm2 logs miaoshou-ai-zcode --lines 30 --nostream >&2 || true
+  exit 1
+fi
+echo "miaoshou-ai-zcode ready: ${BODY}"
+
+# 环境断言（2026-11-05 事故加固）：从 /proc environ 反查 .env.production 的
+# 每一行，任何一行未如实进入运行进程即部署失败——绝不允许配置与进程静默分叉。
+RUN_PID="$(pm2 pid miaoshou-ai-zcode)"
+ENV_MISMATCH=0
+while IFS= read -r env_line; do
+  if ! tr '\0' '\n' < "/proc/${RUN_PID}/environ" | grep -qxF -- "${env_line}"; then
+    echo "环境变量未如实生效：${env_line%%=*}" >&2
+    ENV_MISMATCH=1
+  fi
+done < <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "${ENV_FILE}")
+if [ "${ENV_MISMATCH}" -ne 0 ]; then
+  echo "进程环境与 ${ENV_FILE} 不一致，部署判定失败，请立即检查（勿 pm2 save）" >&2
+  exit 1
+fi
+
+pm2 save
+exit 0
