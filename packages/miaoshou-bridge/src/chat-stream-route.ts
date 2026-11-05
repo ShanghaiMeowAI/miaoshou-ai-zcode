@@ -31,6 +31,7 @@ import {
   type PendingPermission,
 } from "./chat-shared.js";
 import { startSessionIdleSweep } from "./chat-idle-sweep.js";
+import { createRowServiceCache, resolveTurnEntityId } from "./chat-row-query.js";
 import { attachTurnHub } from "./chat-turn-hub.js";
 import { registerChatGuard } from "./chat-registration.js";
 import { registerRunReconnectRoutes } from "./chat-run-reconnect.js";
@@ -49,8 +50,8 @@ import {
 import { registerHistoryCommandRoutes } from "./chat-command-ops.js";
 import { resolveRequestedModel, switchSessionModel } from "./chat-model-selection.js";
 import {
-  awaitTurnPersist,
   bootstrapTurnPersistence,
+  persistChatTurn,
   persistResumeUserAction,
   persistTurnResult,
   replayDeniedToolResults,
@@ -71,6 +72,8 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
 
   const rawAgentService = services.get(IZCodeAgentService);
   const projectService = services.getOptional(IProjectService);
+  // 落库映射用的可信行查询连接：失败不阻断落库，映射缺席只影响后续重试定位
+  const rowService = createRowServiceCache(rawAgentService);
 
   /** 统一的挂起审批过期清扫：超 TTL 的审批一律自动拒绝并删除。 */
   const sweepExpiredPending = (): void => {
@@ -729,21 +732,19 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
         // 此处不再重复清理
         runRegistry.delete(runKey);
         runExecutionRegistry.delete(runKey);
-        // 轮次结束把对话回写平台消息表：经会话串行链写入，保证审批轮与
-        // resume 轮的落库先后顺序（乱序会让前端 markResolvedInterrupts
-        // 判错，审批卡片复活成待处理）。落库逻辑拆在 chat-persistence；
-        // 超时兜底 8 秒后照常发 done，对话本身不因落库受阻
+        // 轮次结束回写平台消息表：串行链保证审批/resume 轮落库顺序；
+        // 超时兜底 8 秒后照常发 done，对话不因落库受阻（实现见 chat-persistence）
         if (tracked.conversationId !== undefined) {
-          await awaitTurnPersist(
-            persistTurnResult({
-              conversationId: tracked.conversationId,
-              isResume,
-              message,
-              assistantText: accumulator.assistantText,
-              recordedBlocks,
-              userAlreadyPersisted: (await userMessagePersisted) === true,
-            }),
-          );
+          // 映射随消息落库，重试/编辑据此直查运行时行，不再比对文本
+          await persistChatTurn({
+            conversationId: tracked.conversationId,
+            isResume,
+            message,
+            assistantText: accumulator.assistantText,
+            recordedBlocks,
+            userMessagePersisted,
+            zcodeEntityId: resolveTurnEntityId(rowService, workspacePath, tracked.sessionId),
+          });
         }
         // 消息落库之后再置运行完成：前端刷新时优先看到完整消息，
         // 不会把已结束的轮次误判为运行中

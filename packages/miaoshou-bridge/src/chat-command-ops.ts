@@ -10,9 +10,12 @@ import type { Context } from "hono";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { randomUUID } from "node:crypto";
-import { createZCodeAgentConnectionScope } from "@zcode/services";
 import {
-  BRIDGE_COMMAND_CLIENT_ID,
+  createRowServiceCache,
+  latestAssistantEntityId,
+  type RowService,
+} from "./chat-row-query.js";
+import {
   applySyntheticToolResult,
   buildCommandEnvelope,
   conversationSessionMap,
@@ -34,25 +37,12 @@ const MAX_QUEUED_DELTA_BYTES = 512 * 1024;
 /** 行投影翻窗上限：每窗 200 行，最多回看 3 窗（约几十轮历史） */
 const ROWS_WINDOW_LIMIT = 200;
 const ROWS_MAX_WINDOWS = 3;
-/** 文本匹配窗口：行与平台消息都可能在存储层被截断，取前缀比对 */
-const TEXT_MATCH_PREFIX = 400;
 
-interface CommandAgentService {
+interface CommandAgentService extends RowService {
   sendConversationCommandV4(params: {
     workspacePath: string;
     envelope: Record<string, unknown>;
   }): Promise<unknown>;
-  conversationRowsRangeV4(params: {
-    workspacePath: string;
-    sessionId: string;
-    limit: number;
-    beforeRowId?: number;
-  }): Promise<{
-    rows: Array<Record<string, unknown>>;
-    hasMore: boolean;
-    atRevision: number;
-    atLogEpoch: string;
-  }>;
   onDynamicSessionEvent(params: {
     workspacePath: string;
     sessionId: string;
@@ -86,6 +76,7 @@ interface PlatformMessage {
   conversation_id: number;
   role: string;
   content: string;
+  extra?: Record<string, unknown> | null;
 }
 
 async function fetchPlatformMessage(
@@ -126,10 +117,6 @@ async function fetchThreadIdentity(
   }
 }
 
-function normalizeText(value: string): string {
-  return value.replace(/\s+/g, " ").trim().slice(0, TEXT_MATCH_PREFIX);
-}
-
 /**
  * 平台消息表同步截断：runtime rewind 掉旧轮后，agent_messages 是追加式表，
  * 不同步删除的话刷新后旧轮会以"追加"形态复活（编辑语义在存储层失效）。
@@ -168,35 +155,21 @@ interface RowTarget {
 }
 
 /**
- * 在行投影里解析目标行：重试匹配 assistantText 行，编辑匹配 userInput 行。
- * 同文本多条时按 occurrence（1-based，从旧到新）取第 N 条。行可能缺
- * entityId（旧版帧），一律跳过。
- *
- * 匹配与选取要考虑多段拼合：一轮里模型分多段输出、中间穿插多次工具调用时，
- * 平台保存的 assistant 全文是各段的拼接，底层行投影里每行只是一个片段，
- * 而运行时的 canRetry/canEdit 只挂在可操作的那一行上。因此：
- * - 文本候选接受"全文包含该片段"（末段是全文后缀，前缀匹配永远够不到）；
- * - 候选里存在带权威动作标记（canRetry/canEdit）的行时，只在可操作行里选，
- *   否则会命中工具调用之间的中间段并被运行时守卫拒绝（guard.actionUnavailable）。
+ * 在行投影里解析目标行。定位只认两种依据，绝不比对文本：
+ * 1) 平台消息落库时记录的运行时实体编号（entityId），跨重启稳定，精确直查；
+ * 2) 前端标记"目标是最后一条"时，取运行时的权威可操作行（canRetry/canEdit），
+ *    运行时只会把这两个许可下发给最新一轮。
+ * 历史轮次在运行时没有被授予动作许可，只能如实拒绝——不再用文本猜行。
  */
 async function resolveRowTarget(
   deps: HistoryCommandDeps,
   tracked: TrackedConversation,
   kind: "userInput" | "assistantText",
-  text: string,
-  occurrence: number,
+  options: { entityId?: string; allowLatestFallback: boolean },
 ): Promise<{ target: RowTarget; baseRevision: number; baseLogEpoch: string } | string> {
-  const wanted = normalizeText(text);
   let beforeRowId: number | undefined;
   let meta: { atRevision: number; atLogEpoch: string } | undefined;
-  const matches: Array<RowTarget & { actionable: boolean; hasActions: boolean; diag: string }> = [];
-  // 取证采样：尾部最新助手行与全窗口带动作标记的行，用于确认 canRetry 挂在哪一行
-  let tailAssistantDiag: string | undefined;
-  const actionRowsDiag: string[] = [];
-  // 失败诊断采样：恢复后的投影若整体缺 actions（hydration 未重建动作标记），
-  // 或 canRetry 不在候选行上，需要原始行摘要才能区分，避免继续盲猜
-  let rowsSeen = 0;
-  let rowsWithActions = 0;
+  const rows: Array<Record<string, unknown>> = [];
   for (let window = 0; window < ROWS_MAX_WINDOWS; window += 1) {
     const result = await deps.rawAgentService.conversationRowsRangeV4({
       workspacePath: deps.workspacePath,
@@ -205,98 +178,60 @@ async function resolveRowTarget(
       ...(beforeRowId !== undefined ? { beforeRowId } : {}),
     });
     meta = { atRevision: result.atRevision, atLogEpoch: result.atLogEpoch };
-    const rows = [...(result.rows ?? [])].sort((a, b) => Number(a.rowId) - Number(b.rowId));
-    for (const row of rows) {
-      rowsSeen += 1;
-      if (row.actions !== undefined) {
-        rowsWithActions += 1;
-        if (actionRowsDiag.length < 5) {
-          actionRowsDiag.push(
-            `#${Number(row.rowId)} kind=${String(row.kind)} state=${String(row.state)} actions=${JSON.stringify(row.actions)}`,
-          );
-        }
-      }
-      if (row.kind === "assistantText") {
-        const tailHead =
-          typeof row.text === "string" ? row.text.replace(/\s+/g, " ").trim().slice(0, 24) : "";
-        tailAssistantDiag = `#${Number(row.rowId)} state=${String(row.state)} actions=${JSON.stringify(row.actions ?? null)} head=${tailHead}`;
-      }
-      if (row.kind !== kind) continue;
-      const entityId = row.entityId;
-      const rowId = Number(row.rowId);
-      if (typeof entityId !== "string" || !entityId || !Number.isFinite(rowId)) continue;
-      const rowText = typeof row.text === "string" ? row.text : "";
-      const normRow = normalizeText(rowText);
-      if (!normRow) continue;
-      const actions = row.actions as { canRetry?: unknown; canEdit?: unknown } | undefined;
-      const actionable =
-        kind === "userInput" ? actions?.canEdit === true : actions?.canRetry === true;
-      if (kind === "userInput") {
-        if (normRow !== wanted) continue;
-      } else {
-        const headLen = Math.min(12, Math.min(normRow.length, wanted.length));
-        const matchesHead = headLen >= 6 && normRow.slice(0, headLen) === wanted.slice(0, headLen);
-        // 多段拼合时末段只是全文后缀，必须有"全文包含片段"这一档候选
-        const contained = normRow.length >= 6 && wanted.includes(normRow);
-        if (
-          !wanted.startsWith(normRow) &&
-          !normRow.startsWith(wanted) &&
-          !matchesHead &&
-          !contained
-        ) {
-          continue;
-        }
-      }
-      matches.push({
-        rowId,
-        entityId,
-        actionable,
-        hasActions: actions !== undefined,
-        diag: `#${rowId} state=${String(row.state)} actions=${JSON.stringify(actions ?? null)} head=${normRow.slice(0, 24)}`,
-      });
-    }
-    if (matches.filter((item) => item.actionable).length >= occurrence) break;
+    const windowRows = [...(result.rows ?? [])].sort((a, b) => Number(a.rowId) - Number(b.rowId));
+    rows.unshift(...windowRows);
     if (!result.hasMore) break;
-    const smallestRowId = rows.length > 0 ? Number(rows[0]?.rowId) : undefined;
+    const smallestRowId = windowRows.length > 0 ? Number(windowRows[0]?.rowId) : undefined;
     if (smallestRowId === undefined) break;
     beforeRowId = smallestRowId;
   }
-  // matches 按行窗从新到旧收集，翻页拼接后仍偏新。按 rowId 升序重排后取第
-  // occurrence 条（1-based 旧→新）；不存在的序号直接报错，绝不静默取近似行。
-  matches.sort((a, b) => a.rowId - b.rowId);
-  const actionableMatches = matches.filter((item) => item.actionable);
-  // 服务端下发了动作标记却没有任何可操作行：如实报告不可操作，不再让运行时守卫
-  // 抛出一句含糊的 actionUnavailable；旧版帧不带 actions 时退回纯文本匹配
-  if (actionableMatches.length === 0 && matches.some((item) => item.hasActions)) {
-    console.warn(
-      `[miaoshou-bridge] 行解析无可操作行 kind=${kind} rowsSeen=${rowsSeen} rowsWithActions=${rowsWithActions} candidates=${matches.length} ${matches
-        .map((item) => item.diag)
-        .join(" | ")}`,
-    );
-    return kind === "userInput"
-      ? "该提问所在轮次已不可编辑（运行时未提供编辑能力）"
-      : "该回复所在轮次已不可重试（运行时未提供重试能力）";
-  }
-  const pool = actionableMatches.length > 0 ? actionableMatches : matches;
-  const target = pool[occurrence - 1];
-  if (target) {
-    // 命中即落行摘要：冷恢复后动作标记/状态是否被重建、守卫为何仍拒绝，
-    // 都靠这行原始数据区分（只有重试/编辑这类人工操作会触发，量很小）
-    console.warn(
-      `[miaoshou-bridge] 行解析命中 kind=${kind} rowsSeen=${rowsSeen} rowsWithActions=${rowsWithActions} candidates=${matches.length} actionable=${actionableMatches.length} chosen=${target.diag} tailAssistant=${tailAssistantDiag ?? "none"} actionRows=${actionRowsDiag.join(" ; ") || "none"}`,
-    );
-  }
-  if (!target || !meta) {
-    console.warn(
-      `[miaoshou-bridge] 行解析未命中 kind=${kind} rowsSeen=${rowsSeen} rowsWithActions=${rowsWithActions} candidates=${matches.length} wanted=${wanted.slice(0, 24)}`,
-    );
-    return `在会话行投影中找不到目标${kind === "userInput" ? "提问" : "回复"}（可能超出可操作范围）`;
-  }
-  return {
-    target: { rowId: target.rowId, entityId: target.entityId },
+  const notFound =
+    kind === "userInput"
+      ? "该提问已超出可编辑范围（运行时只允许编辑最新一轮）"
+      : "该回复已超出可重试范围（运行时只允许重试最新一轮）";
+  if (!meta) return notFound;
+  const eligible = rows.filter((row) => {
+    if (row.kind !== kind) return false;
+    const entityId = row.entityId;
+    const rowId = Number(row.rowId);
+    return typeof entityId === "string" && entityId !== "" && Number.isFinite(rowId);
+  });
+  const actionable = (row: Record<string, unknown>): boolean => {
+    const actions = row.actions as { canRetry?: unknown; canEdit?: unknown } | undefined;
+    return kind === "userInput" ? actions?.canEdit === true : actions?.canRetry === true;
+  };
+  const toTarget = (row: Record<string, unknown>): RowTarget => ({
+    rowId: Number(row.rowId),
+    entityId: String(row.entityId),
+  });
+  const hit = (
+    row: Record<string, unknown>,
+  ): { target: RowTarget; baseRevision: number; baseLogEpoch: string } => ({
+    target: toTarget(row),
     baseRevision: meta.atRevision,
     baseLogEpoch: meta.atLogEpoch,
-  };
+  });
+  // 1) 映射直查：落库时记录过运行时实体编号
+  if (options.entityId) {
+    const mapped = eligible.find((row) => row.entityId === options.entityId);
+    if (mapped) {
+      if (actionable(mapped)) return hit(mapped);
+      return kind === "userInput"
+        ? "该提问已超出可编辑范围（运行时只允许编辑最新一轮）"
+        : "该回复已超出可重试范围（运行时只允许重试最新一轮）";
+    }
+  }
+  // 2) 末条兜底：前端确认目标是最后一条，直接采用运行时的权威可操作行
+  if (options.allowLatestFallback) {
+    const latest = [...eligible].reverse().find(actionable);
+    if (latest) {
+      console.warn(
+        `[miaoshou-bridge] 按运行时权威行兜底 kind=${kind} target=#${String(latest.rowId)} entityId=${String(latest.entityId)}`,
+      );
+      return hit(latest);
+    }
+  }
+  return notFound;
 }
 
 /**
@@ -356,11 +291,21 @@ export async function handleMessageCommand(
   if (!tracked) {
     return c.json({ detail: "该会话的历史轮次无法恢复（运行时未保留），请直接发送新消息" }, 409);
   }
-  const occurrence = Number(c.req.query("occurrence")) || 1;
+  // 前端确认目标是最后一条时带 last=1：运行时的动作许可只发给最新一轮，
+  // 这条标记允许在文本失步时直接采用运行时的权威可操作行
+  const allowLatestFallback = c.req.query("last") === "1";
   const kind = args.mode === "edit" ? "userInput" : "assistantText";
+  const mappedEntityId =
+    typeof platformMessage.extra?.zcode_entity_id === "string" &&
+    platformMessage.extra.zcode_entity_id
+      ? platformMessage.extra.zcode_entity_id
+      : undefined;
   let resolved: Awaited<ReturnType<typeof resolveRowTarget>>;
   try {
-    resolved = await resolveRowTarget(deps, tracked, kind, platformMessage.content, occurrence);
+    resolved = await resolveRowTarget(deps, tracked, kind, {
+      entityId: mappedEntityId,
+      allowLatestFallback,
+    });
   } catch (error) {
     console.error(
       `[miaoshou-bridge] resolveRowTarget 异常 (${args.mode})`,
@@ -630,9 +575,15 @@ export async function handleMessageCommand(
 
       await finished;
       if (conversationId !== undefined) {
+        const zcodeEntityId = await latestAssistantEntityId(
+          deps.rawAgentService,
+          deps.workspacePath,
+          tracked.sessionId,
+        ).catch(() => undefined);
         await awaitTurnPersist(
           persistTurnResult({
             conversationId,
+            zcodeEntityId,
             // 重试沿用原提问（截断保留了用户消息），编辑的旧提问已被截断、
             // 新提问随本轮落库；两轮都需要重新写入用户消息的只有编辑
             isResume: args.mode === "retry",
@@ -664,47 +615,15 @@ export async function handleMessageCommand(
   });
 }
 
-async function createHandshakenCommandService(
-  base: CommandAgentService,
-): Promise<CommandAgentService> {
-  const scope = createZCodeAgentConnectionScope(base as never, {
-    connectionId: `bridge-cmd-${randomUUID()}`,
-    clientMode: "web-remote-replayable",
-    role: "terminal-client",
-  });
-  // terminal-client 连接必须先 hello → clientHello 才允许 v4 调用（rowsRange 等），
-  // 只建 scope 不握手会被 assertReady 以 handshakeRequired 拒绝
-  const hello = await scope.service.helloConversationV4();
-  await scope.service.initializeConversationV4({
-    kind: "clientHello",
-    protocolVersion: hello.protocolVersion,
-    clientId: BRIDGE_COMMAND_CLIENT_ID,
-    clientKind: "web",
-    appVersion: "miaoshou-bridge",
-    capabilities: {
-      ...(hello.capabilities?.workflowRunDeltas === true ? { workflowRunDeltas: true } : {}),
-      ...(hello.capabilities?.historyFirst === true ? { historyFirst: true } : {}),
-    },
-  });
-  return scope.service as unknown as CommandAgentService;
-}
-
 /**
  * 挂载编辑/重试路由：兼顾带 /agent 与 /agent-harness 网关前缀以及不带前缀的路径，
  * 与聊天流的注册惯例一致。编辑的新文本在请求体 {newText} 里。
  */
 export function registerHistoryCommandRoutes(app: Hono, deps: HistoryCommandDeps): void {
   // 复用一条已握手的可信连接：建链失败时清掉缓存，下一次请求重新握手
-  let trusted: Promise<CommandAgentService> | undefined;
-  const ensureTrusted = (): Promise<CommandAgentService> => {
-    if (!trusted) {
-      trusted = createHandshakenCommandService(deps.rawAgentService).catch((error) => {
-        trusted = undefined;
-        throw error;
-      });
-    }
-    return trusted;
-  };
+  const rowService = createRowServiceCache(deps.rawAgentService);
+  const ensureTrusted = (): Promise<CommandAgentService> =>
+    rowService.ensure() as Promise<CommandAgentService>;
 
   const runCommand = async (
     c: Context,

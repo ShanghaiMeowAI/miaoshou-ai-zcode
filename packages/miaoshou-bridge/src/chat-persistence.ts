@@ -31,6 +31,8 @@ export interface TurnPersistInput {
   recordedBlocks: Array<Record<string, unknown>>;
   /** 用户消息已在流开始时落库成功：收尾只补助手消息，不再重复写用户行 */
   userAlreadyPersisted?: boolean;
+  /** 运行时助手行的稳定实体编号：重试据此直查行，不再比对文本 */
+  zcodeEntityId?: string;
 }
 
 /**
@@ -78,6 +80,33 @@ export function bootstrapTurnPersistence(params: {
 }
 
 /**
+ * 聊天流收尾的统一落库入口：等待（最多 8 秒）轮次消息回写平台表。
+ * 运行时助手行的实体编号随消息一起写入 extra，重试/编辑据此直查，
+ * 彻底取代文本匹配；取映射失败只降级为不记录，不影响落库。
+ */
+export async function persistChatTurn(params: {
+  conversationId: number;
+  isResume: boolean;
+  message: string;
+  assistantText: string;
+  recordedBlocks: Array<Record<string, unknown>>;
+  userMessagePersisted?: Promise<boolean>;
+  zcodeEntityId?: Promise<string | undefined>;
+}): Promise<void> {
+  await awaitTurnPersist(
+    persistTurnResult({
+      conversationId: params.conversationId,
+      isResume: params.isResume,
+      message: params.message,
+      assistantText: params.assistantText,
+      recordedBlocks: params.recordedBlocks,
+      userAlreadyPersisted: (await params.userMessagePersisted) === true,
+      zcodeEntityId: await params.zcodeEntityId,
+    }),
+  );
+}
+
+/**
  * 轮次收尾把对话回写平台消息表：经会话串行链写入，保证审批轮与 resume 轮
  * 的落库先后顺序（乱序会让前端 markResolvedInterrupts 判错，审批卡片复活
  * 成待处理）。回写失败只记日志——回写是展示层需求，绝不能因它打断对话。
@@ -87,7 +116,7 @@ export function persistTurnResult(input: TurnPersistInput): Promise<boolean> {
     const messages: Array<{
       role: "user" | "assistant";
       content: string;
-      extra?: { blocks: Array<Record<string, unknown>> };
+      extra?: Record<string, unknown>;
     }> = [];
     // resume 轮的用户动作已在流开始时单独落库；聊天/编辑轮的用户消息
     // 也在流开始时即时落库（失败时收尾补写），此处只补助手消息
@@ -98,7 +127,12 @@ export function persistTurnResult(input: TurnPersistInput): Promise<boolean> {
       messages.push({
         role: "assistant",
         content: input.assistantText || "（本轮没有文本回复）",
-        extra: input.recordedBlocks.length > 0 ? { blocks: input.recordedBlocks } : undefined,
+        extra: {
+          ...(input.recordedBlocks.length > 0 ? { blocks: input.recordedBlocks } : {}),
+          // 平台消息 ↔ 运行时行 的对应关系随消息一起落库：重试/编辑据此定位，
+          // 杜绝文本匹配（文本在两套存储间会失步，且运行时只允许操作最新一轮）
+          ...(input.zcodeEntityId ? { zcode_entity_id: input.zcodeEntityId } : {}),
+        },
       });
     }
     if (messages.length === 0) return true;

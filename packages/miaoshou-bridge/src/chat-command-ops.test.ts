@@ -1,8 +1,9 @@
 /**
  * 会话历史操作（编辑重发/重试轮次）的回归测试：
- * - 行投影解析：按角色与文本匹配、occurrence 序号、CAS 水位透传
+ * - 行定位：优先按落库映射（实体编号）直查，绝不比对文本；
+ *   无映射且标记末条时采用运行时权威可操作行（canRetry/canEdit）
  * - 命令信封：retryTurn/editUserQuery 的 target 与 baseRevision
- * - 受理失败回 JSON、消息不可读回 404
+ * - 受理失败回 JSON、消息不可读回 404、历史轮次明确拒绝
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleMessageCommand, type HistoryCommandDeps } from "./chat-command-ops.js";
@@ -25,7 +26,7 @@ function jsonContext(param: string, query = ""): any {
     req: {
       raw: { headers: new Headers({ "x-user-id": "42" }) },
       param: () => param,
-      query: () => query,
+      query: (key?: string) => (key ? (new URLSearchParams(query).get(key) ?? "") : query),
       json: async () => ({}),
     },
     header: () => {},
@@ -45,7 +46,7 @@ function makeDeps(overrides?: Partial<HistoryCommandDeps>): {
 } {
   const commandCalls: Array<Record<string, any>> = [];
   let eventHandler: ((event: Record<string, unknown>) => void) | undefined;
-  const deps: HistoryCommandDeps = {
+  const deps = {
     workspacePath: "/tmp/ws",
     extractIdentity: () => ({ userId: "42", role: "user" }),
     rawAgentService: {
@@ -59,8 +60,22 @@ function makeDeps(overrides?: Partial<HistoryCommandDeps>): {
       }),
       conversationRowsRangeV4: vi.fn(async () => ({
         rows: [
-          { rowId: 1, kind: "userInput", entityId: "u1", text: "330跑个五年的回测" },
-          { rowId: 2, kind: "assistantText", entityId: "a1", text: "回测完成：run_id 10811" },
+          {
+            rowId: 1,
+            kind: "userInput",
+            entityId: "u1",
+            state: "complete",
+            text: "330跑个五年的回测",
+            actions: { canEdit: true, editDisposition: "rewind" },
+          },
+          {
+            rowId: 2,
+            kind: "assistantText",
+            entityId: "a1",
+            state: "complete",
+            text: "回测完成：run_id 10811",
+            actions: { canRetry: true, canFork: true },
+          },
         ],
         hasMore: false,
         atRevision: 7,
@@ -72,7 +87,7 @@ function makeDeps(overrides?: Partial<HistoryCommandDeps>): {
       },
     },
     ...overrides,
-  };
+  } as unknown as HistoryCommandDeps;
   return {
     deps,
     commandCalls,
@@ -118,9 +133,56 @@ describe("chat history commands", () => {
     vi.unstubAllGlobals();
   });
 
-  it("retry 解析 assistant 行并发送带 CAS 水位的命令", async () => {
+  it("按落库映射直查目标行：即使有同动作的干扰行也不误选", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: unknown) => {
+        const url = String(input);
+        if (url.includes("/internal/bridge/messages/123?")) {
+          return new Response(
+            JSON.stringify({
+              id: 123,
+              conversation_id: 5,
+              role: "assistant",
+              content: "回测完成：run_id 10811",
+              extra: { zcode_entity_id: "a1" },
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.includes("/internal/bridge/conversations/5")) {
+          return new Response(JSON.stringify({ id: 5, thread_id: "sess-1" }), { status: 200 });
+        }
+        return new Response("{}", { status: 200 });
+      }),
+    );
     const { deps, commandCalls, hasEventHandler, fireSessionEvent } = makeDeps();
-    const promise = handleMessageCommand(jsonContext("123"), deps, { mode: "retry" });
+    deps.rawAgentService.conversationRowsRangeV4 = vi.fn(async () => ({
+      rows: [
+        {
+          rowId: 2,
+          kind: "assistantText",
+          entityId: "a1",
+          state: "complete",
+          text: "第一版回复",
+          actions: { canRetry: true },
+        },
+        {
+          rowId: 9,
+          kind: "assistantText",
+          entityId: "a2",
+          state: "complete",
+          text: "另一版回复",
+          actions: { canRetry: true },
+        },
+      ],
+      hasMore: false,
+      atRevision: 7,
+      atLogEpoch: "epoch-1",
+    })) as never;
+    const promise = handleMessageCommand(jsonContext("123", "last=1"), deps, {
+      mode: "retry",
+    });
     await vi.waitFor(() => expect(hasEventHandler()).toBe(true));
     fireSessionEvent({
       type: "turn.completed",
@@ -128,26 +190,14 @@ describe("chat history commands", () => {
     });
     const response = await promise;
     expect(response.status).toBe(200);
-    expect(commandCalls).toHaveLength(1);
-    expect(commandCalls[0]!.type).toBe("retryTurn");
-    expect(commandCalls[0]!.sessionId).toBe("sess-1");
     expect(commandCalls[0]!.payload.target).toEqual({ rowId: 2, entityId: "a1" });
     expect(commandCalls[0]!.baseRevision).toBe(7);
     expect(commandCalls[0]!.baseLogEpoch).toBe("epoch-1");
   });
 
-  it("occurrence 取同文本第 N 次出现的行", async () => {
+  it("映射缺失且标记末条时采用运行时权威可重试行", async () => {
     const { deps, commandCalls, hasEventHandler, fireSessionEvent } = makeDeps();
-    deps.rawAgentService.conversationRowsRangeV4 = vi.fn(async () => ({
-      rows: [
-        { rowId: 2, kind: "assistantText", entityId: "a1", text: "回测完成：run_id 10811" },
-        { rowId: 9, kind: "assistantText", entityId: "a2", text: "回测完成：run_id 10811" },
-      ],
-      hasMore: false,
-      atRevision: 7,
-      atLogEpoch: "epoch-1",
-    }));
-    const promise = handleMessageCommand(jsonContext("123", "occurrence=1"), deps, {
+    const promise = handleMessageCommand(jsonContext("123", "last=1"), deps, {
       mode: "retry",
     });
     await vi.waitFor(() => expect(hasEventHandler()).toBe(true));
@@ -160,137 +210,16 @@ describe("chat history commands", () => {
     expect(commandCalls[0]!.payload.target).toEqual({ rowId: 2, entityId: "a1" });
   });
 
-  it("平台全文由多段输出拼合时，以底层行首段仍能命中目标行", async () => {
-    // 生产事故回归：一轮里模型先输出一段文字、中间穿插几十次工具调用、
-    // 最后再补一段，平台的 assistant 全文是这几段的拼合；底层行投影里
-    // 每一行只是其中一个片段。旧的 startsWith 方向写反（短行 startsWith 全文）
-    // 恒为假，导致这类会话的重试全部报"找不到目标回复"。
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: unknown) => {
-        const url = String(input);
-        if (url.includes("/internal/bridge/messages/123?")) {
-          return new Response(
-            JSON.stringify({
-              id: 123,
-              conversation_id: 5,
-              role: "assistant",
-              content:
-                "我来查询您已保存的全部策略。正在逐页检索全部 46 条策略（单次最多返回 20 条），已确认 42 条，还差 4 条在补齐。我已确认 45 条，还差最后 1 条",
-            }),
-            { status: 200 },
-          );
-        }
-        if (url.includes("/internal/bridge/conversations/5")) {
-          return new Response(JSON.stringify({ id: 5, thread_id: "sess-1" }), { status: 200 });
-        }
-        return new Response("{}", { status: 200 });
-      }),
-    );
-    const { deps, commandCalls, hasEventHandler, fireSessionEvent } = makeDeps();
-    deps.rawAgentService.conversationRowsRangeV4 = vi.fn(async () => ({
-      rows: [
-        { rowId: 1, kind: "userInput", entityId: "u1", text: "我有哪些策略，我要全部的" },
-        { rowId: 2, kind: "assistantText", entityId: "a1", text: "我来查询您已保存的全部策略。" },
-        { rowId: 3, kind: "assistantText", entityId: "a2", text: "我已确认 45 条，还差最后 1 条" },
-      ],
-      hasMore: false,
-      atRevision: 7,
-      atLogEpoch: "epoch-1",
-    }));
-    const promise = handleMessageCommand(jsonContext("123"), deps, { mode: "retry" });
-    await vi.waitFor(() => expect(hasEventHandler()).toBe(true));
-    fireSessionEvent({
-      type: "turn.completed",
-      eventId: globalThis.crypto.randomUUID(),
-    });
-    const response = await promise;
-    expect(response.status).toBe(200);
-    expect(commandCalls).toHaveLength(1);
-    expect(commandCalls[0]!.payload.target).toEqual({ rowId: 2, entityId: "a1" });
-  });
-
-  it("多段拼合时优先选中带 canRetry 的末段行", async () => {
-    // 生产事故回归：一轮内多段输出，中间段文字也在平台全文里，但只有末段
-    // 携带 canRetry；选中中间段会被运行时守卫拒收（guard.actionUnavailable）。
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: unknown) => {
-        const url = String(input);
-        if (url.includes("/internal/bridge/messages/123?")) {
-          return new Response(
-            JSON.stringify({
-              id: 123,
-              conversation_id: 5,
-              role: "assistant",
-              content: "我来查询您已保存的全部策略。已确认 45 条，还差最后 1 条",
-            }),
-            { status: 200 },
-          );
-        }
-        if (url.includes("/internal/bridge/conversations/5")) {
-          return new Response(JSON.stringify({ id: 5, thread_id: "sess-1" }), { status: 200 });
-        }
-        return new Response("{}", { status: 200 });
-      }),
-    );
-    const { deps, commandCalls, hasEventHandler, fireSessionEvent } = makeDeps();
-    deps.rawAgentService.conversationRowsRangeV4 = vi.fn(async () => ({
-      rows: [
-        { rowId: 1, kind: "userInput", entityId: "u1", text: "我有哪些策略，我要全部的" },
-        {
-          rowId: 2,
-          kind: "assistantText",
-          entityId: "a1",
-          text: "我来查询您已保存的全部策略。",
-          actions: { canFork: true },
-        },
-        {
-          rowId: 9,
-          kind: "assistantText",
-          entityId: "a9",
-          text: "已确认 45 条，还差最后 1 条",
-          actions: { canRetry: true, canFork: true },
-        },
-      ],
-      hasMore: false,
-      atRevision: 7,
-      atLogEpoch: "epoch-1",
-    }));
-    const promise = handleMessageCommand(jsonContext("123"), deps, { mode: "retry" });
-    await vi.waitFor(() => expect(hasEventHandler()).toBe(true));
-    fireSessionEvent({
-      type: "turn.completed",
-      eventId: globalThis.crypto.randomUUID(),
-    });
-    const response = await promise;
-    expect(response.status).toBe(200);
-    expect(commandCalls[0]!.payload.target).toEqual({ rowId: 9, entityId: "a9" });
-  });
-
-  it("文本命中但运行时不提供重试能力时给出明确提示", async () => {
-    const { deps } = makeDeps();
-    deps.rawAgentService.conversationRowsRangeV4 = vi.fn(async () => ({
-      rows: [
-        {
-          rowId: 2,
-          kind: "assistantText",
-          entityId: "a1",
-          text: "回测完成：run_id 10811",
-          actions: { canFork: true },
-        },
-      ],
-      hasMore: false,
-      atRevision: 7,
-      atLogEpoch: "epoch-1",
-    }));
+  it("映射缺失且未标记末条时明确拒绝，不再猜行", async () => {
+    const { deps, commandCalls } = makeDeps();
     const response = await handleMessageCommand(jsonContext("123"), deps, { mode: "retry" });
     expect(response.status).toBe(409);
-    const body = (await response.json()) as { detail?: string };
-    expect(body.detail).toContain("不可重试");
+    expect(commandCalls).toHaveLength(0);
+    const detail = (await response.json()) as { detail: string };
+    expect(detail.detail).toContain("超出可重试范围");
   });
 
-  it("平台消息文本在行投影中无匹配时返回 409", async () => {
+  it("映射命中但运行时未授予动作许可（历史轮次）时明确拒绝", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: unknown) => {
@@ -301,7 +230,8 @@ describe("chat history commands", () => {
               id: 123,
               conversation_id: 5,
               role: "assistant",
-              content: "完全不同的另一条回复内容",
+              content: "历史回复",
+              extra: { zcode_entity_id: "a-old" },
             }),
             { status: 200 },
           );
@@ -313,12 +243,18 @@ describe("chat history commands", () => {
       }),
     );
     const { deps, commandCalls } = makeDeps();
-    const response = await handleMessageCommand(jsonContext("123"), deps, {
+    deps.rawAgentService.conversationRowsRangeV4 = vi.fn(async () => ({
+      rows: [
+        { rowId: 2, kind: "assistantText", entityId: "a-old", state: "complete", text: "历史回复" },
+      ],
+      hasMore: false,
+      atRevision: 7,
+      atLogEpoch: "epoch-1",
+    })) as never;
+    const response = await handleMessageCommand(jsonContext("123", "last=1"), deps, {
       mode: "retry",
     });
     expect(response.status).toBe(409);
-    const detail = (await response.json()) as { detail: string };
-    expect(detail.detail).toContain("找不到目标");
     expect(commandCalls).toHaveLength(0);
   });
 
@@ -343,7 +279,7 @@ describe("chat history commands", () => {
       message: "stale projection",
       revisionAtDecision: 7,
     }));
-    const response = await handleMessageCommand(jsonContext("123"), deps, {
+    const response = await handleMessageCommand(jsonContext("123", "last=1"), deps, {
       mode: "retry",
     });
     expect(response.status).toBe(409);
@@ -384,7 +320,9 @@ describe("chat history commands", () => {
       conversationId: 5,
     }));
     const { deps, commandCalls, hasEventHandler, fireSessionEvent } = makeDeps({ recoverTracked });
-    const promise = handleMessageCommand(jsonContext("123"), deps, { mode: "retry" });
+    const promise = handleMessageCommand(jsonContext("123", "last=1"), deps, {
+      mode: "retry",
+    });
     await vi.waitFor(() => expect(hasEventHandler()).toBe(true));
     fireSessionEvent({
       type: "turn.completed",
