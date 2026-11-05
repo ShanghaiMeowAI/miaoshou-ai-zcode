@@ -210,6 +210,86 @@ describe("chat history commands", () => {
     expect(commandCalls[0]!.payload.target).toEqual({ rowId: 2, entityId: "a1" });
   });
 
+  it("多段拼合时优先选中带 canRetry 的末段行", async () => {
+    // 生产事故回归：一轮内多段输出，中间段文字也在平台全文里，但只有末段
+    // 携带 canRetry；选中中间段会被运行时守卫拒收（guard.actionUnavailable）。
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: unknown) => {
+        const url = String(input);
+        if (url.includes("/internal/bridge/messages/123?")) {
+          return new Response(
+            JSON.stringify({
+              id: 123,
+              conversation_id: 5,
+              role: "assistant",
+              content: "我来查询您已保存的全部策略。已确认 45 条，还差最后 1 条",
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.includes("/internal/bridge/conversations/5")) {
+          return new Response(JSON.stringify({ id: 5, thread_id: "sess-1" }), { status: 200 });
+        }
+        return new Response("{}", { status: 200 });
+      }),
+    );
+    const { deps, commandCalls, hasEventHandler, fireSessionEvent } = makeDeps();
+    deps.rawAgentService.conversationRowsRangeV4 = vi.fn(async () => ({
+      rows: [
+        { rowId: 1, kind: "userInput", entityId: "u1", text: "我有哪些策略，我要全部的" },
+        {
+          rowId: 2,
+          kind: "assistantText",
+          entityId: "a1",
+          text: "我来查询您已保存的全部策略。",
+          actions: { canFork: true },
+        },
+        {
+          rowId: 9,
+          kind: "assistantText",
+          entityId: "a9",
+          text: "已确认 45 条，还差最后 1 条",
+          actions: { canRetry: true, canFork: true },
+        },
+      ],
+      hasMore: false,
+      atRevision: 7,
+      atLogEpoch: "epoch-1",
+    }));
+    const promise = handleMessageCommand(jsonContext("123"), deps, { mode: "retry" });
+    await vi.waitFor(() => expect(hasEventHandler()).toBe(true));
+    fireSessionEvent({
+      type: "turn.completed",
+      eventId: globalThis.crypto.randomUUID(),
+    });
+    const response = await promise;
+    expect(response.status).toBe(200);
+    expect(commandCalls[0]!.payload.target).toEqual({ rowId: 9, entityId: "a9" });
+  });
+
+  it("文本命中但运行时不提供重试能力时给出明确提示", async () => {
+    const { deps } = makeDeps();
+    deps.rawAgentService.conversationRowsRangeV4 = vi.fn(async () => ({
+      rows: [
+        {
+          rowId: 2,
+          kind: "assistantText",
+          entityId: "a1",
+          text: "回测完成：run_id 10811",
+          actions: { canFork: true },
+        },
+      ],
+      hasMore: false,
+      atRevision: 7,
+      atLogEpoch: "epoch-1",
+    }));
+    const response = await handleMessageCommand(jsonContext("123"), deps, { mode: "retry" });
+    expect(response.status).toBe(409);
+    const body = (await response.json()) as { detail?: string };
+    expect(body.detail).toContain("不可重试");
+  });
+
   it("平台消息文本在行投影中无匹配时返回 409", async () => {
     vi.stubGlobal(
       "fetch",

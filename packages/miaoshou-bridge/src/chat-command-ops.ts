@@ -169,8 +169,15 @@ interface RowTarget {
 
 /**
  * 在行投影里解析目标行：重试匹配 assistantText 行，编辑匹配 userInput 行。
- * 同文本多条时按 occurrence（1-based，从旧到新）取第 N 条；缺省取最靠近
- * 尾部的一条。行可能缺 entityId（旧版帧），一律跳过。
+ * 同文本多条时按 occurrence（1-based，从旧到新）取第 N 条。行可能缺
+ * entityId（旧版帧），一律跳过。
+ *
+ * 匹配与选取要考虑多段拼合：一轮里模型分多段输出、中间穿插多次工具调用时，
+ * 平台保存的 assistant 全文是各段的拼接，底层行投影里每行只是一个片段，
+ * 而运行时的 canRetry/canEdit 只挂在可操作的那一行上。因此：
+ * - 文本候选接受"全文包含该片段"（末段是全文后缀，前缀匹配永远够不到）；
+ * - 候选里存在带权威动作标记（canRetry/canEdit）的行时，只在可操作行里选，
+ *   否则会命中工具调用之间的中间段并被运行时守卫拒绝（guard.actionUnavailable）。
  */
 async function resolveRowTarget(
   deps: HistoryCommandDeps,
@@ -182,7 +189,7 @@ async function resolveRowTarget(
   const wanted = normalizeText(text);
   let beforeRowId: number | undefined;
   let meta: { atRevision: number; atLogEpoch: string } | undefined;
-  const matches: RowTarget[] = [];
+  const matches: Array<RowTarget & { actionable: boolean; hasActions: boolean }> = [];
   for (let window = 0; window < ROWS_MAX_WINDOWS; window += 1) {
     const result = await deps.rawAgentService.conversationRowsRangeV4({
       workspacePath: deps.workspacePath,
@@ -199,20 +206,29 @@ async function resolveRowTarget(
       if (typeof entityId !== "string" || !entityId || !Number.isFinite(rowId)) continue;
       const rowText = typeof row.text === "string" ? row.text : "";
       const normRow = normalizeText(rowText);
+      if (!normRow) continue;
+      const actions = row.actions as { canRetry?: unknown; canEdit?: unknown } | undefined;
+      const actionable =
+        kind === "userInput" ? actions?.canEdit === true : actions?.canRetry === true;
       if (kind === "userInput") {
         if (normRow !== wanted) continue;
       } else {
-        // assistant 回复可能由多段输出拼合而成，底层行往往只是首段文字；
-        // 匹配必须双向兼顾（平台全文以首段开头，或单行以平台全文开头，或首部 12 字完全重合）
         const headLen = Math.min(12, Math.min(normRow.length, wanted.length));
         const matchesHead = headLen >= 6 && normRow.slice(0, headLen) === wanted.slice(0, headLen);
-        if (!wanted.startsWith(normRow) && !normRow.startsWith(wanted) && !matchesHead) {
+        // 多段拼合时末段只是全文后缀，必须有"全文包含片段"这一档候选
+        const contained = normRow.length >= 6 && wanted.includes(normRow);
+        if (
+          !wanted.startsWith(normRow) &&
+          !normRow.startsWith(wanted) &&
+          !matchesHead &&
+          !contained
+        ) {
           continue;
         }
       }
-      matches.push({ rowId, entityId });
+      matches.push({ rowId, entityId, actionable, hasActions: actions !== undefined });
     }
-    if (matches.length >= occurrence) break;
+    if (matches.filter((item) => item.actionable).length >= occurrence) break;
     if (!result.hasMore) break;
     const smallestRowId = rows.length > 0 ? Number(rows[0]?.rowId) : undefined;
     if (smallestRowId === undefined) break;
@@ -221,11 +237,24 @@ async function resolveRowTarget(
   // matches 按行窗从新到旧收集，翻页拼接后仍偏新。按 rowId 升序重排后取第
   // occurrence 条（1-based 旧→新）；不存在的序号直接报错，绝不静默取近似行。
   matches.sort((a, b) => a.rowId - b.rowId);
-  const target = matches[occurrence - 1];
+  const actionableMatches = matches.filter((item) => item.actionable);
+  // 服务端下发了动作标记却没有任何可操作行：如实报告不可操作，不再让运行时守卫
+  // 抛出一句含糊的 actionUnavailable；旧版帧不带 actions 时退回纯文本匹配
+  if (actionableMatches.length === 0 && matches.some((item) => item.hasActions)) {
+    return kind === "userInput"
+      ? "该提问所在轮次已不可编辑（运行时未提供编辑能力）"
+      : "该回复所在轮次已不可重试（运行时未提供重试能力）";
+  }
+  const pool = actionableMatches.length > 0 ? actionableMatches : matches;
+  const target = pool[occurrence - 1];
   if (!target || !meta) {
     return `在会话行投影中找不到目标${kind === "userInput" ? "提问" : "回复"}（可能超出可操作范围）`;
   }
-  return { target, baseRevision: meta.atRevision, baseLogEpoch: meta.atLogEpoch };
+  return {
+    target: { rowId: target.rowId, entityId: target.entityId },
+    baseRevision: meta.atRevision,
+    baseLogEpoch: meta.atLogEpoch,
+  };
 }
 
 /**
