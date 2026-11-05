@@ -212,3 +212,95 @@ export async function resolveBridgeConversation(
   }
   return undefined;
 }
+
+// ── 配额与用量（CONTRACT.md 已知缺口二期：对话 token 额度闸门） ──────────
+
+export interface BridgeQuotaSnapshot {
+  allowed: boolean;
+  /** 透传 api-agent 返回的完整快照：前端 429 分支会用 detail.quota 整体
+   * 覆盖本地套餐状态（模型列表读 model/models），裁剪会打空前端选择器 */
+  [key: string]: unknown;
+}
+
+export interface ZcodeTurnUsage {
+  modelRequestCount?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  reasoningTokens?: number;
+}
+
+function nonNegativeInt(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return undefined;
+  return Math.floor(value);
+}
+
+/**
+ * ZCode turn.completed 的 ModelUsageSummary → 平台配额计费明细。
+ * AI SDK v6 的 inputTokens 已含 cache read/write 总输入，与 DeepSeek
+ * prompt_cache_hit/miss 二分口径对齐：cache_hit 取 cacheReadTokens，
+ * cache_miss 用总输入减命中补齐（含 cacheWrite，按未命中价计费）。
+ */
+export function mapZcodeTurnUsageToQuotaUsage(usage: ZcodeTurnUsage): {
+  input_tokens: number;
+  cache_hit_input_tokens: number;
+  cache_miss_input_tokens: number;
+  output_tokens: number;
+  reasoning_tokens: number;
+  total_tokens: number;
+} {
+  const inputTokens = nonNegativeInt(usage.inputTokens) ?? 0;
+  const cacheHit = Math.min(nonNegativeInt(usage.cacheReadTokens) ?? 0, inputTokens);
+  const outputTokens = nonNegativeInt(usage.outputTokens) ?? 0;
+  const totalTokens =
+    nonNegativeInt(usage.totalTokens) ?? inputTokens + outputTokens;
+  return {
+    input_tokens: inputTokens,
+    cache_hit_input_tokens: cacheHit,
+    cache_miss_input_tokens: Math.max(0, inputTokens - cacheHit),
+    output_tokens: outputTokens,
+    reasoning_tokens: nonNegativeInt(usage.reasoningTokens) ?? 0,
+    total_tokens: totalTokens,
+  };
+}
+
+/**
+ * 轮前配额校验：api-agent 不可达时返回 undefined，由调用方决定放行策略
+ * （计费服务故障不应阻断全部对话，fail-open 并记错误日志）。
+ */
+export async function fetchBridgeQuota(userId: string): Promise<BridgeQuotaSnapshot | undefined> {
+  const result = await internalPost("/internal/bridge/quota/check", {
+    user_id: Number(userId),
+  });
+  if (!result || typeof result !== "object") return undefined;
+  const record = result as Record<string, unknown>;
+  if (typeof record.allowed !== "boolean") return undefined;
+  return record as BridgeQuotaSnapshot;
+}
+
+export interface BridgeUsageSnapshot {
+  userId: string;
+  conversationId?: number;
+  runId: string;
+  /** 服务端可控的轮次标识（zcode sessionId + 运行时执行 ID）：
+   * 幂等键禁止混入客户端可控的 run_id，否则重放即可免计费 */
+  turnKey: string;
+  usage: ReturnType<typeof mapZcodeTurnUsageToQuotaUsage>;
+}
+
+/**
+ * 轮次 token 用量回写（agent_model_usage_records 表）：fire-and-forget，
+ * 服务端按轮次幂等键去重，失败只记日志——计费缺口可接受，对话不因此中断。
+ */
+export function reportBridgeUsage(snapshot: BridgeUsageSnapshot): void {
+  void internalPost("/internal/bridge/usage", {
+    user_id: Number(snapshot.userId),
+    run_id: snapshot.runId,
+    operation: "agent",
+    ...(snapshot.conversationId ? { conversation_id: snapshot.conversationId } : {}),
+    idempotency_key: `zcode_turn:${snapshot.turnKey}`,
+    usage: snapshot.usage,
+  });
+}

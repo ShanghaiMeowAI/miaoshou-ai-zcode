@@ -61,13 +61,20 @@ quant 是独立进程、它的故障不触发对本进程的重启；依赖状�
 
 已知缺口（二期实现，接入生产流量前必须补齐）：
 
-- 对话 token 额度闸门：旧链路（miaoshou-api-agent 的 /api/agent/chat）按
-  `model_pricing_id` 查 `get_quota_snapshot` 并在超限时返回
-  `429 {detail:{code:"AI_QUOTA_EXCEEDED",...}}`；桥接层目前不校验也不扣减对话
-  额度（回测额度由 api-ast 侧执行，Quant MCP 已有 INSUFFICIENT_QUOTA 分类）。
-  补齐前置：quota 服务暴露 HTTP 接口供 Node 侧调用（直连数据库不可接受），
-  并与产品确认扣减时点；在此之前 `AGENT_QUOTA_ENFORCEMENT_ENABLED` 在两条链路
-  上都保持同一开关状态。
+- ~~对话 token 额度闸门~~ 已补齐：桥接层在新对话轮（非审批回执）启动前经
+  `POST /internal/bridge/quota/check` 调 api-agent 校验套餐快照，超限返回
+  `429 {detail:{code:"AI_QUOTA_EXCEEDED",message,period,reset_at,quota}}`；
+  校验服务不可达时 fail-open 放行并记错误（计费依赖故障不阻断对话）。
+  轮次收口（turn.completed）时把 `ModelUsageSummary` 经映射转换为平台计费
+  明细（inputTokens 含 cache read/write 总输入；cache_hit 取 cacheRead，
+  cache_miss 用总输入减命中补齐），经 `POST /internal/bridge/usage` 以
+  `zcode_turn:{zcodeSessionId}:{runtimeExecutionId}` 幂等键回写
+  agent_model_usage_records（键只取服务端可控标识：请求体 run_id 由客户端
+  携带，绝不参与去重，否则重放即可免计费），服务端按套餐默认价格行计费。
+  校验前置于 resume 解析之后：伪造 resume 降级成的普通对话轮同样过闸，
+  仅经后端核实的审批回执（pendingResolution）跳过。开关为 `AGENT_QUOTA_ENFORCEMENT_ENABLED`（沿用
+  api-agent 同名变量），两条链路必须保持同一状态；用量登记不受开关控制
+  （由 api-agent 侧 `AGENT_USAGE_METERING_ENABLED` 决定是否落库）。
 - 前端请求体里的 `model_pricing_id`/`model_id` 被静默忽略（会话使用默认模型）：
   不能显式拒绝（旧前端所有请求都携带该字段），完整支持依赖会话级模型设置链路。
 

@@ -57,10 +57,20 @@ import {
   replayDeniedToolResults,
 } from "./chat-persistence.js";
 import {
+  fetchBridgeQuota,
+  mapZcodeTurnUsageToQuotaUsage,
+  reportBridgeUsage,
   resolveBridgeConversation,
   saveBridgeConversationSession,
+  type ZcodeTurnUsage,
 } from "./bridge-internal-client.js";
 import { recoverTrackedConversation, createTrackedRecovery } from "./chat-session-recovery.js";
+
+// 对话 token 额度闸门开关：与 miaoshou-api-agent 的同名开关保持同一状态
+// （CONTRACT.md 已知缺口二期），一条链路开一条链路关会让配额口径分裂
+const QUOTA_ENFORCEMENT_ENABLED = ["1", "true", "yes", "on"].includes(
+  (process.env.AGENT_QUOTA_ENFORCEMENT_ENABLED ?? "").trim().toLowerCase(),
+);
 
 export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollection): void {
   const workspacePath = process.env.ZCODE_SERVER_WORKSPACE?.trim() || DEFAULT_WORKSPACE_PATH;
@@ -227,6 +237,41 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
         pendingResolution = resolution;
         // 不发新 prompt：被批准的工具在原轮次内继续执行，
         // 下方观察流把它的执行结果与终态继续推给前端。
+      }
+    }
+
+    // 轮前配额校验：必须在 resume 解析之后判定，伪造 resume 载荷降级成的
+    // 普通对话轮同样要过闸。只有 pendingResolution（经后端核实的真实审批
+    // 回执，放行的是已启动的工具调用，回测额度由 api-ast 侧执行）跳过。
+    // 校验服务不可达时放行并记错误：计费依赖故障不应阻断全部对话，
+    // 宁可漏记不可全拦。
+    if (QUOTA_ENFORCEMENT_ENABLED && !pendingResolution) {
+      const quota = await fetchBridgeQuota(identity.userId);
+      if (quota === undefined) {
+        console.error(
+          "[miaoshou-bridge] 配额校验服务不可达，本轮放行（fail-open）",
+        );
+      } else if (!quota.allowed) {
+        const period = quota.blocked_period === "weekly" ? "weekly" : "daily";
+        const resetAt =
+          (quota[period] as { resets_at?: string } | undefined)?.resets_at ?? "";
+        const messageText =
+          period === "weekly"
+            ? "本周 AI 额度已用完，下周重置后再试"
+            : "今日 AI 额度已用完，明日重置后再试";
+        releaseStreamSlot();
+        return c.json(
+          {
+            detail: {
+              code: "AI_QUOTA_EXCEEDED",
+              message: messageText,
+              period,
+              reset_at: resetAt,
+              quota,
+            },
+          },
+          429,
+        );
       }
     }
 
@@ -554,7 +599,32 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
                 const completion = (event.payload ?? {}) as {
                   resultType?: string;
                   response?: string;
+                  usage?: ZcodeTurnUsage;
+                  inputId?: string;
                 };
+                // 轮次 token 用量回写：ModelUsageSummary 汇总按轮次幂等键
+                // 落进平台计费表；缺会话编号或用量缺席时跳过（不虚记）。
+                // 幂等键只取服务端可控的会话与执行标识——run_id 由请求体
+                // 携带，仅作记录字段，绝不能参与去重（重放即可免计费）
+                const usageConversationId =
+                  tracked?.conversationId ?? bridgeConversation?.id;
+                if (completion.usage && usageConversationId) {
+                  const serverTurnId =
+                    foregroundExecutionId ?? completion.inputId ?? "";
+                  if (serverTurnId) {
+                    reportBridgeUsage({
+                      userId: identity.userId,
+                      conversationId: usageConversationId,
+                      runId,
+                      turnKey: `${sessionId}:${serverTurnId}`,
+                      usage: mapZcodeTurnUsageToQuotaUsage(completion.usage),
+                    });
+                  } else {
+                    console.error(
+                      "[miaoshou-bridge] 本轮缺少运行时执行标识，用量未回写（防重放计费）",
+                    );
+                  }
+                }
                 const abnormal =
                   completion.resultType !== undefined &&
                   completion.resultType !== "success" &&
