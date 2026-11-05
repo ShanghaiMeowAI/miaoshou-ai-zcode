@@ -29,6 +29,7 @@ import {
 import { handleSessionEvent, type StreamAccumulator } from "./chat-stream-events.js";
 import { handlePermissionRequestedEvent, resolvePermissionWith } from "./approval-routes.js";
 import { createRunSnapshotWriter } from "./chat-run-sync.js";
+import { attachTurnHub } from "./chat-turn-hub.js";
 import { awaitTurnPersist, persistChatUserMessage, persistTurnResult } from "./chat-persistence.js";
 import type { MiaoshouUserIdentity } from "./index.js";
 
@@ -368,7 +369,9 @@ export async function handleMessageCommand(
       ? persistChatUserMessage(conversationId, args.newText ?? "")
       : undefined;
 
-  const runId = `run_${Date.now()}`;
+  // 运行编号用 uuid：前端按编号格式把它路由到桥接层重连端点（实时续流），
+  // run_时间戳 会被判成旧链路运行而落到数据库快照轮询
+  const runId = randomUUID();
   return streamSSE(c, async (stream) => {
     const cleanupFns: Array<() => void> = [];
     try {
@@ -394,6 +397,25 @@ export async function handleMessageCommand(
         userId: identity.userId,
         getBlocks: () => recordedBlocks,
       });
+      // 初始快照立即写：重试/编辑轮次开头刷新也要能拿到 active_run_id
+      runWriter.start();
+      // 接入轮次事件总线：原响应是第一个观察者，刷新后的重连页面共享同一总线
+      const hub = attachTurnHub({
+        runId,
+        userId: identity.userId,
+        snapshot: () => ({
+          type: "run_snapshot",
+          run_id: runId,
+          status: "running",
+          blocks: recordedBlocks,
+        }),
+        cleanupFns,
+        onEvent: (payload) => {
+          writeChain = writeChain
+            .then(() => stream.writeSSE({ data: JSON.stringify(payload) }))
+            .catch(() => {});
+        },
+      });
 
       const writeEvent = (payload: unknown, isDelta = false): void => {
         if (settled) return;
@@ -406,36 +428,26 @@ export async function handleMessageCommand(
             if (!accumulator.stickyTruncated) {
               accumulator.stickyTruncated = true;
               accumulator.truncated = true;
-              writeChain = writeChain
-                .then(() =>
-                  stream.writeSSE({
-                    data: JSON.stringify({
-                      type: "message_delta",
-                      content: "\n\n[回答过长，输出已截断；可收窄问题范围后重试]",
-                    }),
-                  }),
-                )
-                .catch(() => {});
+              hub.publish({
+                type: "message_delta",
+                content: "\n\n[回答过长，输出已截断；可收窄问题范围后重试]",
+              });
             }
             return;
           }
           serialized = JSON.stringify(payload);
           accumulator.queuedDeltaBytes += Buffer.byteLength(serialized, "utf8");
         }
-        const text = serialized ?? JSON.stringify(payload);
-        writeChain = writeChain
-          .then(() => stream.writeSSE({ data: text }))
-          .catch(() => {})
-          .then(() => {
-            if (isDelta && serialized) {
-              accumulator.queuedDeltaBytes -= Buffer.byteLength(serialized, "utf8");
-            }
+        hub.publish(payload);
+        if (isDelta && serialized) {
+          const deltaBytes = Buffer.byteLength(serialized, "utf8");
+          writeChain = writeChain.then(() => {
+            accumulator.queuedDeltaBytes -= deltaBytes;
           });
+        }
       };
       const writeFinalEvent = (payload: unknown): void => {
-        writeChain = writeChain
-          .then(() => stream.writeSSE({ data: JSON.stringify(payload) }))
-          .catch(() => {});
+        hub.publish(payload);
       };
       const heartbeat = setInterval(() => {
         if (!settled) void stream.write(": ping\n\n").catch(() => {});
