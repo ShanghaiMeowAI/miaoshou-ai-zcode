@@ -5,6 +5,7 @@
  */
 import { drainDeniedToolResults, enqueueConversationWrite, eventToolName } from "./chat-shared.js";
 import { appendBridgeMessages } from "./bridge-internal-client.js";
+import { createRunSnapshotWriter, type RunSnapshotWriter } from "./chat-run-sync.js";
 
 /** 回写兜底上限：api-agent 不可达时最多等这么久，之后照常发 done */
 export const TURN_PERSIST_WAIT_MS = 8_000;
@@ -28,6 +29,52 @@ export interface TurnPersistInput {
   message: string;
   assistantText: string;
   recordedBlocks: Array<Record<string, unknown>>;
+  /** 用户消息已在流开始时落库成功：收尾只补助手消息，不再重复写用户行 */
+  userAlreadyPersisted?: boolean;
+}
+
+/**
+ * 聊天/编辑轮的用户消息在流开始时立即落库：输出进行中刷新页面时，
+ * 数据库已有用户提问可显示；晚落库会让前端刷新后的草稿渲染因
+ * "消息列表尾部不是用户消息"被静默跳过，界面呈现空会话。
+ * 返回落库是否成功，收尾据此决定是否补写用户行（失败不丢消息）。
+ */
+export function persistChatUserMessage(conversationId: number, message: string): Promise<boolean> {
+  return enqueueConversationWrite(conversationId, () =>
+    appendBridgeMessages(conversationId, [{ role: "user", content: message }]),
+  );
+}
+
+export interface TurnStreamBootstrap {
+  runWriter: RunSnapshotWriter;
+  userMessagePersisted?: Promise<boolean>;
+}
+
+/**
+ * 聊天流开场的轮次引导：初始 running 快照立即写、用户消息即时落库。
+ * 两件事都必须发生在流开头——快照晚了刷新拿不到 active_run_id，
+ * 用户消息晚了刷新后的草稿渲染会被静默跳过（界面呈现空会话）。
+ */
+export function bootstrapTurnPersistence(params: {
+  conversationId: number | undefined;
+  runId: string;
+  userId: string;
+  getBlocks: () => Array<Record<string, unknown>>;
+  message: string;
+  isResume: boolean;
+}): TurnStreamBootstrap {
+  const runWriter = createRunSnapshotWriter({
+    conversationId: params.conversationId,
+    runId: params.runId,
+    userId: params.userId,
+    getBlocks: params.getBlocks,
+  });
+  runWriter.start();
+  const userMessagePersisted =
+    !params.isResume && params.conversationId !== undefined
+      ? persistChatUserMessage(params.conversationId, params.message)
+      : undefined;
+  return { runWriter, userMessagePersisted };
 }
 
 /**
@@ -42,8 +89,9 @@ export function persistTurnResult(input: TurnPersistInput): Promise<boolean> {
       content: string;
       extra?: { blocks: Array<Record<string, unknown>> };
     }> = [];
-    // resume 轮的用户动作已在流开始时单独落库，此处只补助手消息
-    if (!input.isResume) {
+    // resume 轮的用户动作已在流开始时单独落库；聊天/编辑轮的用户消息
+    // 也在流开始时即时落库（失败时收尾补写），此处只补助手消息
+    if (!input.isResume && !input.userAlreadyPersisted) {
       messages.push({ role: "user", content: input.message });
     }
     if (input.assistantText || input.recordedBlocks.length > 0) {

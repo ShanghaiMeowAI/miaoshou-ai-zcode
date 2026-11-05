@@ -9,6 +9,10 @@ import { upsertBridgeRun } from "./bridge-internal-client.js";
 const RUN_SNAPSHOT_THROTTLE_MS = 800;
 
 export interface RunSnapshotWriter {
+  /** 流开始立即写一次 running 快照（不等节流）：轮次开头刷新也要能
+   *  拿到 active_run_id。不能用 finish() 代替——它写 completed，会被
+   *  运行时读取接口判为"无运行"。 */
+  start(): void;
   /** 标记内容有更新，节流后写一次 running 快照。 */
   markDirty(): void;
   /** 轮次结束：立即写一次 completed 快照。 */
@@ -44,6 +48,9 @@ export function createRunSnapshotWriter(params: {
   };
 
   return {
+    start() {
+      void write("running");
+    },
     markDirty() {
       if (disposed || timer !== undefined) return;
       timer = setTimeout(() => {

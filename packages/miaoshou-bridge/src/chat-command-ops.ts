@@ -26,7 +26,7 @@ import {
 import { handleSessionEvent, type StreamAccumulator } from "./chat-stream-events.js";
 import { handlePermissionRequestedEvent, resolvePermissionWith } from "./approval-routes.js";
 import { createRunSnapshotWriter } from "./chat-run-sync.js";
-import { awaitTurnPersist, persistTurnResult } from "./chat-persistence.js";
+import { awaitTurnPersist, persistChatUserMessage, persistTurnResult } from "./chat-persistence.js";
 import type { MiaoshouUserIdentity } from "./index.js";
 
 const HEARTBEAT_INTERVAL_MS = 15_000;
@@ -334,6 +334,12 @@ export async function handleMessageCommand(
       truncateFromMessage(conversationId, messageId, identity.userId),
     );
   }
+  // 编辑轮的新提问即时落库（串行链保证排在截断之后）：与聊天流同一理由，
+  // 输出进行中刷新可见提问；成败记入收尾，早写失败时收尾补写
+  const userMessagePersisted =
+    args.mode === "edit" && conversationId !== undefined
+      ? persistChatUserMessage(conversationId, args.newText ?? "")
+      : undefined;
 
   const runId = `run_${Date.now()}`;
   return streamSSE(c, async (stream) => {
@@ -551,6 +557,7 @@ export async function handleMessageCommand(
             message: args.mode === "edit" ? (args.newText ?? "") : "",
             assistantText: accumulator.assistantText,
             recordedBlocks,
+            userAlreadyPersisted: (await userMessagePersisted) === true,
           }),
         );
       }

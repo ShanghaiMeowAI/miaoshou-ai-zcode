@@ -41,10 +41,10 @@ import {
 } from "./approval-routes.js";
 import { handleSessionEvent, type StreamAccumulator } from "./chat-stream-events.js";
 import { registerHistoryCommandRoutes } from "./chat-command-ops.js";
-import { createRunSnapshotWriter } from "./chat-run-sync.js";
 import { resolveRequestedModel, switchSessionModel } from "./chat-model-selection.js";
 import {
   awaitTurnPersist,
+  bootstrapTurnPersistence,
   persistResumeUserAction,
   persistTurnResult,
   replayDeniedToolResults,
@@ -384,17 +384,17 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
           stickyTruncated: false,
           queuedDeltaBytes: 0,
         };
-        // 运行快照:写平台 agent_runs,供运行时接口与刷新后的运行恢复读取
-        const runWriter = createRunSnapshotWriter({
+        // 运行快照与用户消息早落库的轮次引导：初始 running 快照立即写、
+        // 用户提问即时入库，细节拆在 chat-persistence
+        const { runWriter, userMessagePersisted } = bootstrapTurnPersistence({
           conversationId: tracked.conversationId,
           runId,
           userId: identity.userId,
           getBlocks: () => recordedBlocks,
+          message,
+          isResume,
         });
         cleanupFns.push(() => runWriter.dispose());
-        // 初始快照立即写(不等节流):用户在轮次刚开始时刷新,也要能拿到
-        // active_run_id 与恢复卡片
-        runWriter.finish().catch(() => {});
         runWriter.markDirty();
 
         stream.onAbort(() => {
@@ -742,6 +742,7 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
               message,
               assistantText: accumulator.assistantText,
               recordedBlocks,
+              userAlreadyPersisted: (await userMessagePersisted) === true,
             }),
           );
         }
