@@ -9,6 +9,7 @@ import {
   prepareModelTelemetryEnv,
   resolveOtlpMetricEndpoint,
   resolveOtlpTraceEndpoint,
+  resolveTraceSampleRatio,
   shutdownPreparedModelTelemetry,
 } from "../src/bootstrap.js";
 import { NoopAgentExecutionTelemetry } from "../src/agent-trace-runtime.js";
@@ -79,6 +80,17 @@ describe("Telemetry V4 bootstrap", () => {
       "x-a": "one,two",
       "x-b": "hello world",
     });
+  });
+
+  it("OTEL_TRACES_SAMPLER_ARG 覆盖采样比例，非法值回落内置默认", () => {
+    expect(resolveTraceSampleRatio({ OTEL_TRACES_SAMPLER_ARG: "1" })).toBe(1);
+    expect(resolveTraceSampleRatio({ OTEL_TRACES_SAMPLER_ARG: " 0.5 " })).toBe(0.5);
+    expect(resolveTraceSampleRatio({ OTEL_TRACES_SAMPLER_ARG: "0" })).toBe(0);
+    expect(resolveTraceSampleRatio({})).toBeUndefined();
+    expect(resolveTraceSampleRatio({ OTEL_TRACES_SAMPLER_ARG: "" })).toBeUndefined();
+    expect(resolveTraceSampleRatio({ OTEL_TRACES_SAMPLER_ARG: "abc" })).toBeUndefined();
+    expect(resolveTraceSampleRatio({ OTEL_TRACES_SAMPLER_ARG: "1.5" })).toBeUndefined();
+    expect(resolveTraceSampleRatio({ OTEL_TRACES_SAMPLER_ARG: "-0.1" })).toBeUndefined();
   });
 
   it("Standalone 异步生成并复用随机 installation id", async () => {

@@ -70,6 +70,7 @@ OTEL_EXPORTER_OTLP_TRACES_HEADERS
 OTEL_EXPORTER_OTLP_HEADERS
 OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
 OTEL_EXPORTER_OTLP_METRICS_HEADERS
+OTEL_TRACES_SAMPLER_ARG
 OTEL_SERVICE_NAME
 ZCODE_MODEL_TELEMETRY_ENABLED
 ZCODE_TELEMETRY_DEVICE_MID
@@ -444,6 +445,10 @@ Exporter Failure、Shutdown Timeout 的专属 Metric 尚未实现，Dashboard �
 `ParentBasedSampler(TraceIdRatioBasedSampler(0.10))` 做确定性的 10% Head Sampling；同一条
 Trace 的子 Span 必须继承父 Span 决策，禁止按 Span 独立抽样形成残缺树。Metric 不跟随 Trace
 采样，准确流量、成功率、Token 和延迟分位数继续由全量 Metric 提供。
+
+部署方可通过 OTel 标准变量 `OTEL_TRACES_SAMPLER_ARG`（0~1，缺省 0.10）覆盖采样比例；
+自托管逐条诊断后端（如 Langfuse OTLP 接入点）可设为 `1` 全量采集。非法或越界值忽略并
+回落默认，不阻断启动。
 
 客户端 Head Sampling 在 Span 开始时决策，无法知道最终是否失败或变慢。因此当前阶段接受错误
 Trace 也按 10% 抽样的成本/诊断取舍，不能声称失败、慢请求已 100% 保留。若后续引入 Collector

@@ -114,6 +114,19 @@ export function parseOtlpHeaders(value: string | undefined): Record<string, stri
 }
 
 /**
+ * OTel 标准采样比例变量（0~1）。自建后端按 10% 默认值采集即可；自托管
+ * Langfuse 这类逐条诊断场景需要全量 Trace，通过该变量放宽到 1。
+ * 非法值一律忽略并回落内置默认，不阻断启动。
+ */
+export function resolveTraceSampleRatio(env: EnvRecord): number | undefined {
+  const raw = env.OTEL_TRACES_SAMPLER_ARG?.trim();
+  if (!raw) return undefined;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0 || value > 1) return undefined;
+  return value;
+}
+
+/**
  * 在 CLI 的异步启动边界准备身份并动态加载 OTel SDK。同步 App 工厂只借用已准备好的
  * 进程级 Owner；disabled 路径不会 import SDK/Exporter。
  */
@@ -186,6 +199,7 @@ async function createPreparedOwner(
       ),
       onWarning: options.onWarning,
       resource,
+      traceSampleRatio: resolveTraceSampleRatio(env),
     });
   } catch (error) {
     options.onWarning?.("Agent telemetry runtime initialization failed", {

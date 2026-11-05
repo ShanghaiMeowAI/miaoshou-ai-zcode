@@ -43,6 +43,34 @@ EOF
 chmod 600 .env.production
 ```
 
+### Langfuse 诊断追踪接入（可选，追加到 .env.production）
+
+CLI 子进程继承本进程环境变量，标准 OTel 变量一配即通：每个 CLI 运行时的
+模型调用 span（含 `gen_ai.request.model`、`gen_ai.usage.input_tokens/output_tokens`、
+`gen_ai.tool.*` 与 `zcode.execution.session_id`）会以 OTLP 协议推送到 Langfuse。
+`zcode.execution.session_id` 与平台会话表 `agent_conversations.zcode_session_id`
+同源，Langfuse 里按该属性检索即可对回平台会话。
+
+```bash
+# 先算好鉴权头（public_key:secret_key 的 base64）：
+#   echo -n 'pk-xxx:sk-xxx' | base64
+cat >> .env.production <<'EOF'
+OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=<Langfuse 地址>/api/public/otel/v1/traces
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic%20<上面的 base64>
+OTEL_TRACES_SAMPLER_ARG=1
+EOF
+```
+
+注意事项：
+
+- `OTEL_TRACES_SAMPLER_ARG=1` 是全量采样（内置默认 0.10）；诊断用途建议全量。
+- 只配 traces 端点时，CLI 的 Metric 导出会按既有回落规则沿用同一 URL
+  （`docs/trace/reference/runtime-and-operations.md` §1.2），Langfuse 不收
+  OTLP Metric，每 5 分钟会在子进程 stderr 留一条导出失败日志，属预期噪音，
+  不影响 Trace 上报。
+- 改完 `.env.production` 后执行一次 `bash scripts/deploy-miaoshou.sh` 重载生效。
+- Langfuse 侧需先开启 OTLP 接入（项目设置里的 OTel/Credentials）。
+
 之后每次部署（或 CI 自动执行的内容）：
 
 ```bash
