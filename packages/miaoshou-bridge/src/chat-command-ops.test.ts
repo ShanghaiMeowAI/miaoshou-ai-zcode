@@ -160,6 +160,56 @@ describe("chat history commands", () => {
     expect(commandCalls[0]!.payload.target).toEqual({ rowId: 2, entityId: "a1" });
   });
 
+  it("平台全文由多段输出拼合时，以底层行首段仍能命中目标行", async () => {
+    // 生产事故回归：一轮里模型先输出一段文字、中间穿插几十次工具调用、
+    // 最后再补一段，平台的 assistant 全文是这几段的拼合；底层行投影里
+    // 每一行只是其中一个片段。旧的 startsWith 方向写反（短行 startsWith 全文）
+    // 恒为假，导致这类会话的重试全部报"找不到目标回复"。
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: unknown) => {
+        const url = String(input);
+        if (url.includes("/internal/bridge/messages/123?")) {
+          return new Response(
+            JSON.stringify({
+              id: 123,
+              conversation_id: 5,
+              role: "assistant",
+              content:
+                "我来查询您已保存的全部策略。正在逐页检索全部 46 条策略（单次最多返回 20 条），已确认 42 条，还差 4 条在补齐。我已确认 45 条，还差最后 1 条",
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.includes("/internal/bridge/conversations/5")) {
+          return new Response(JSON.stringify({ id: 5, thread_id: "sess-1" }), { status: 200 });
+        }
+        return new Response("{}", { status: 200 });
+      }),
+    );
+    const { deps, commandCalls, hasEventHandler, fireSessionEvent } = makeDeps();
+    deps.rawAgentService.conversationRowsRangeV4 = vi.fn(async () => ({
+      rows: [
+        { rowId: 1, kind: "userInput", entityId: "u1", text: "我有哪些策略，我要全部的" },
+        { rowId: 2, kind: "assistantText", entityId: "a1", text: "我来查询您已保存的全部策略。" },
+        { rowId: 3, kind: "assistantText", entityId: "a2", text: "我已确认 45 条，还差最后 1 条" },
+      ],
+      hasMore: false,
+      atRevision: 7,
+      atLogEpoch: "epoch-1",
+    }));
+    const promise = handleMessageCommand(jsonContext("123"), deps, { mode: "retry" });
+    await vi.waitFor(() => expect(hasEventHandler()).toBe(true));
+    fireSessionEvent({
+      type: "turn.completed",
+      eventId: globalThis.crypto.randomUUID(),
+    });
+    const response = await promise;
+    expect(response.status).toBe(200);
+    expect(commandCalls).toHaveLength(1);
+    expect(commandCalls[0]!.payload.target).toEqual({ rowId: 2, entityId: "a1" });
+  });
+
   it("平台消息文本在行投影中无匹配时返回 409", async () => {
     vi.stubGlobal(
       "fetch",

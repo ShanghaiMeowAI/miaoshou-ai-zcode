@@ -198,10 +198,17 @@ async function resolveRowTarget(
       const rowId = Number(row.rowId);
       if (typeof entityId !== "string" || !entityId || !Number.isFinite(rowId)) continue;
       const rowText = typeof row.text === "string" ? row.text : "";
+      const normRow = normalizeText(rowText);
       if (kind === "userInput") {
-        if (normalizeText(rowText) !== wanted) continue;
-      } else if (!normalizeText(rowText).startsWith(wanted)) {
-        continue;
+        if (normRow !== wanted) continue;
+      } else {
+        // assistant 回复可能由多段输出拼合而成，底层行往往只是首段文字；
+        // 匹配必须双向兼顾（平台全文以首段开头，或单行以平台全文开头，或首部 12 字完全重合）
+        const headLen = Math.min(12, Math.min(normRow.length, wanted.length));
+        const matchesHead = headLen >= 6 && normRow.slice(0, headLen) === wanted.slice(0, headLen);
+        if (!wanted.startsWith(normRow) && !normRow.startsWith(wanted) && !matchesHead) {
+          continue;
+        }
       }
       matches.push({ rowId, entityId });
     }
