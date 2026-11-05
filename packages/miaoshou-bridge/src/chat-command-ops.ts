@@ -264,6 +264,13 @@ async function resolveRowTarget(
   }
   const pool = actionableMatches.length > 0 ? actionableMatches : matches;
   const target = pool[occurrence - 1];
+  if (target) {
+    // 命中即落行摘要：冷恢复后动作标记/状态是否被重建、守卫为何仍拒绝，
+    // 都靠这行原始数据区分（只有重试/编辑这类人工操作会触发，量很小）
+    console.warn(
+      `[miaoshou-bridge] 行解析命中 kind=${kind} rowsSeen=${rowsSeen} rowsWithActions=${rowsWithActions} candidates=${matches.length} actionable=${actionableMatches.length} chosen=${target.diag}`,
+    );
+  }
   if (!target || !meta) {
     console.warn(
       `[miaoshou-bridge] 行解析未命中 kind=${kind} rowsSeen=${rowsSeen} rowsWithActions=${rowsWithActions} candidates=${matches.length} wanted=${wanted.slice(0, 24)}`,
