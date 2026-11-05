@@ -31,7 +31,9 @@ import {
   type PendingPermission,
 } from "./chat-shared.js";
 import { startSessionIdleSweep } from "./chat-idle-sweep.js";
+import { attachTurnHub } from "./chat-turn-hub.js";
 import { registerChatGuard } from "./chat-registration.js";
+import { registerRunReconnectRoutes } from "./chat-run-reconnect.js";
 import {
   handlePermissionRequestedEvent,
   parsePendingResume,
@@ -39,7 +41,11 @@ import {
   resolvePermissionWith,
   sweepExpiredPendingWith,
 } from "./approval-routes.js";
-import { handleSessionEvent, type StreamAccumulator } from "./chat-stream-events.js";
+import {
+  dropDeltaWhenOverflow,
+  handleSessionEvent,
+  type StreamAccumulator,
+} from "./chat-stream-events.js";
 import { registerHistoryCommandRoutes } from "./chat-command-ops.js";
 import { resolveRequestedModel, switchSessionModel } from "./chat-model-selection.js";
 import {
@@ -325,48 +331,25 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
         const writeEvent = (payload: unknown, isDelta = false): void => {
           if (settled) return;
           let serialized: string | undefined;
+          if (isDelta && dropDeltaWhenOverflow({ accumulator, publish: hub.publish, payload })) {
+            return;
+          }
           if (isDelta) {
-            // 粘性截断：一旦触发丢弃，后续正文全部不再发送，避免中间出现空洞
-            if (
-              accumulator.stickyTruncated ||
-              accumulator.queuedDeltaBytes > MAX_QUEUED_DELTA_BYTES
-            ) {
-              if (!accumulator.stickyTruncated) {
-                accumulator.stickyTruncated = true;
-                accumulator.truncated = true;
-                // 截断必须给用户可见提示，否则慢客户端看到的是静默半截答案
-                writeChain = writeChain
-                  .then(() =>
-                    stream.writeSSE({
-                      data: JSON.stringify({
-                        type: "message_delta",
-                        content: "\n\n[回答过长，输出已截断；可收窄问题范围后重试]",
-                      }),
-                    }),
-                  )
-                  .catch(() => {});
-              }
-              return;
-            }
             serialized = JSON.stringify(payload);
             accumulator.queuedDeltaBytes += Buffer.byteLength(serialized, "utf8");
           }
-          const text = serialized ?? JSON.stringify(payload);
-          writeChain = writeChain
-            .then(() => stream.writeSSE({ data: text }))
-            .catch(() => {})
-            .then(() => {
-              if (isDelta && serialized) {
-                accumulator.queuedDeltaBytes -= Buffer.byteLength(serialized, "utf8");
-              }
+          hub.publish(payload);
+          if (isDelta && serialized) {
+            const deltaBytes = Buffer.byteLength(serialized, "utf8");
+            writeChain = writeChain.then(() => {
+              accumulator.queuedDeltaBytes -= deltaBytes;
             });
+          }
         };
         // 终态专用写入：绕过 settled 检查——done 延后到回写落库后的收尾段才发，
         // 那时 settled 已置位，普通 writeEvent 会把终态丢弃
         const writeFinalEvent = (payload: unknown): void => {
-          writeChain = writeChain
-            .then(() => stream.writeSSE({ data: JSON.stringify(payload) }))
-            .catch(() => {});
+          hub.publish(payload);
         };
 
         const heartbeat = setInterval(() => {
@@ -384,8 +367,7 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
           stickyTruncated: false,
           queuedDeltaBytes: 0,
         };
-        // 运行快照与用户消息早落库的轮次引导：初始 running 快照立即写、
-        // 用户提问即时入库，细节拆在 chat-persistence
+        // 轮次引导：初始 running 快照与用户消息即时落库，细节拆在 chat-persistence
         const { runWriter, userMessagePersisted } = bootstrapTurnPersistence({
           conversationId: tracked.conversationId,
           runId,
@@ -396,6 +378,23 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
         });
         cleanupFns.push(() => runWriter.dispose());
         runWriter.markDirty();
+        // 轮次事件总线挂载：重连页面经重连端点共享同一总线
+        const hub = attachTurnHub({
+          runId,
+          userId: identity.userId,
+          snapshot: () => ({
+            type: "run_snapshot",
+            run_id: runId,
+            status: "running",
+            blocks: recordedBlocks,
+          }),
+          cleanupFns,
+          onEvent: (payload) => {
+            writeChain = writeChain
+              .then(() => stream.writeSSE({ data: JSON.stringify(payload) }))
+              .catch(() => {});
+          },
+        });
 
         stream.onAbort(() => {
           // 与 ZCode 官方语义一致：执行属于运行时不依赖客户端连接。
@@ -787,6 +786,7 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
   for (const prefix of ["/api/agent", "/agent/api/agent", "/agent-harness/api/agent"]) {
     app.post(`${prefix}/chat`, handleChat);
   }
+  registerRunReconnectRoutes(app);
 
   registerHistoryCommandRoutes(app, {
     workspacePath,

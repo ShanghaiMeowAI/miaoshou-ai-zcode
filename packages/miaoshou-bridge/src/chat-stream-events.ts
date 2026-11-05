@@ -5,6 +5,7 @@
  */
 import {
   ASSISTANT_TEXT_MAX,
+  MAX_QUEUED_DELTA_BYTES,
   buildToolResultPayload,
   eventToolName,
   normalizeQuantToolName,
@@ -15,6 +16,32 @@ export interface StreamAccumulator {
   truncated: boolean;
   stickyTruncated: boolean;
   queuedDeltaBytes: number;
+}
+
+/**
+ * 增量溢出闸门：排队字节超限时进入粘性截断——丢弃当前增量、补发用户
+ * 可见的截断提示，后续正文全部不再发送（避免中间出现空洞）。
+ * 返回 true 表示该增量已被处置（丢弃），调用方直接返回。
+ */
+export function dropDeltaWhenOverflow(params: {
+  accumulator: StreamAccumulator;
+  publish: (payload: unknown) => void;
+  payload: unknown;
+}): boolean {
+  const { accumulator, publish } = params;
+  if (accumulator.stickyTruncated || accumulator.queuedDeltaBytes <= MAX_QUEUED_DELTA_BYTES) {
+    return false;
+  }
+  if (!accumulator.stickyTruncated) {
+    accumulator.stickyTruncated = true;
+    accumulator.truncated = true;
+    // 截断必须给用户可见提示，否则慢客户端看到的是静默半截答案
+    publish({
+      type: "message_delta",
+      content: "\n\n[回答过长，输出已截断；可收窄问题范围后重试]",
+    });
+  }
+  return true;
 }
 
 /** 回测类工具：runtime 发新名(如 backtest_run)，前端词汇表用旧名
