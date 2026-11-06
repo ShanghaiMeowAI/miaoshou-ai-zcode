@@ -16,7 +16,8 @@ export interface BridgeConversation {
 const CONVERSATION_LOOKUP_CACHE = new Map<number, BridgeConversation>();
 const LOOKUP_CACHE_MAX = 1000;
 
-function internalBaseUrl(): string {
+/** 平台 api-agent 的内网基址：内部回写与 goal 命令执行共用。 */
+export function internalBaseUrl(): string {
   return process.env.AGENT_INTERNAL_BASE_URL?.trim() || "http://127.0.0.1:5005";
 }
 

@@ -65,6 +65,11 @@ import {
   type ZcodeTurnUsage,
 } from "./bridge-internal-client.js";
 import { recoverTrackedConversation, createTrackedRecovery } from "./chat-session-recovery.js";
+import {
+  executeGoalCommand,
+  goalCommandUsesModel,
+  parseGoalCommand,
+} from "./goal-commands.js";
 
 // 对话 token 额度闸门开关：与 miaoshou-api-agent 的同名开关保持同一状态
 // （CONTRACT.md 已知缺口二期），一条链路开一条链路关会让配额口径分裂
@@ -246,12 +251,20 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
       }
     }
 
+    // /goal 系命令本地执行（zcode 命令中心范式：命令不进模型）。纯查询/记录
+    // 类命令不消耗模型额度，不过配额闸门；创建/恢复后的续跑仍走模型，照常过闸
+    const goalCommand = !pendingResolution && !isResume ? parseGoalCommand(message) : undefined;
+
     // 轮前配额校验：必须在 resume 解析之后判定，伪造 resume 载荷降级成的
     // 普通对话轮同样要过闸。只有 pendingResolution（经后端核实的真实审批
     // 回执，放行的是已启动的工具调用，回测额度由 api-ast 侧执行）跳过。
     // 校验服务不可达时放行并记错误：计费依赖故障不应阻断全部对话，
     // 宁可漏记不可全拦。
-    if (QUOTA_ENFORCEMENT_ENABLED && !pendingResolution) {
+    if (
+      QUOTA_ENFORCEMENT_ENABLED &&
+      !pendingResolution &&
+      !(goalCommand && !goalCommandUsesModel(goalCommand))
+    ) {
       const quota = await fetchBridgeQuota(identity.userId);
       if (quota === undefined) {
         console.error(
@@ -769,19 +782,47 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
           }
         }
 
+        // /goal 命令本地执行：先出回执（并下发 goal 事件驱动前端目标卡片
+        // 更新），创建/恢复类命令在回执之后附带 goal 上下文续跑模型
+        let goalContinuationPrompt: string | undefined;
+        if (goalCommand && tracked.conversationId !== undefined) {
+          const goalOutcome = await executeGoalCommand({
+            command: goalCommand,
+            conversationId: tracked.conversationId,
+            userId: identity.userId,
+          });
+          if (goalOutcome.goalEvent) {
+            writeEvent(goalOutcome.goalEvent, false);
+          }
+          recordedBlocks.push({ type: "text", content: goalOutcome.reply });
+          accumulator.assistantText = goalOutcome.reply;
+          runWriter.markDirty();
+          writeEvent({ type: "message_delta", content: goalOutcome.reply }, true);
+          if (goalOutcome.continuationPrompt) {
+            goalContinuationPrompt = goalOutcome.continuationPrompt;
+          } else {
+            // 本地命令即终态：复用轮次收尾（落库 + done），不进模型
+            finalDoneEvent = { type: "done", run_id: runId };
+            settled = true;
+            finishSignal.resolve();
+          }
+        }
+
         // resume 观察流不发新 prompt：被批准的工具在原轮次内继续执行，
         // 本流只负责把它的执行结果与终态推送给前端。
         if (!isResume) {
-          // 不阻塞等待 sendPrompt 返回：无论它何时 resolve/reject，终态都由
-          // 事件流或超时兜底，避免发送环节挂起拖住整个流
-          void rawAgentService
-            .sendPrompt({
-              workspacePath,
-              sessionId,
-              content: message,
-              toolDenylist: SESSION_TOOL_DENYLIST,
-            })
-            .catch((error) => {
+          const promptContent = goalContinuationPrompt ?? (goalCommand ? undefined : message);
+          if (promptContent !== undefined) {
+            // 不阻塞等待 sendPrompt 返回：无论它何时 resolve/reject，终态都由
+            // 事件流或超时兜底，避免发送环节挂起拖住整个流
+            void rawAgentService
+              .sendPrompt({
+                workspacePath,
+                sessionId,
+                content: promptContent,
+                toolDenylist: SESSION_TOOL_DENYLIST,
+              })
+              .catch((error) => {
               const errorText = `调用模型失败：${error instanceof Error ? error.message : String(error)}`;
               recordedBlocks.push({
                 type: "text",
@@ -801,6 +842,7 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
               settled = true;
               finishSignal.resolve();
             });
+          }
         }
 
         // 与官方一致：没有客户端等待上限，轮次由 turn 终态结束
