@@ -77,7 +77,7 @@ describe("executeGoalCommand", () => {
     return {
       url,
       handler: (input: unknown) => {
-        const target = String(input).split("?")[0];
+        const target = String(input).split("?")[0] ?? "";
         if (!target.endsWith(url)) return undefined;
         return {
           ok: status < 400,
@@ -270,7 +270,7 @@ describe("/goal 命令的对话流集成", () => {
           getOptional: () => undefined,
         } as unknown as Parameters<typeof registerMiaoshouChatRoutes>[1];
         const goalApi = vi.fn(async (input: unknown) => {
-          const target = String(input).split("?")[0];
+          const target = String(input).split("?")[0] ?? "";
           if (target.endsWith("/internal/bridge/conversations/9")) {
             return {
               ok: true,
@@ -313,6 +313,106 @@ describe("/goal 命令的对话流集成", () => {
           expect(sendPrompt).not.toHaveBeenCalled();
           expect(text).toContain("Goal #30");
           expect(text).toContain('"type":"done"');
+        } finally {
+          vi.unstubAllGlobals();
+          conversationSessionMap.clear();
+        }
+      },
+    );
+  });
+});
+
+describe("用户停止后中断标记落库", () => {
+  it("cancelled 轮次的半截回答与中断标记一起写入平台消息表", async () => {
+    const { withEnv } = await import("./chat-test-support.js");
+    await withEnv(
+      { ZCODE_SERVER_AUTH_TOKEN: "t", QUANT_MCP_INTERNAL_SECRET: "s", AGENT_INTERNAL_BASE_URL: "http://127.0.0.1:5999" },
+      async () => {
+        const { Hono } = await import("hono");
+        const { registerMiaoshouChatRoutes } = await import("./chat-stream-route.js");
+        const { conversationSessionMap } = await import("./chat-shared.js");
+        conversationSessionMap.clear();
+        conversationSessionMap.set("42:t77", {
+          userId: "42",
+          sessionId: "sess_stop",
+          lastUsedAt: Date.now(),
+          conversationId: 77,
+        });
+        let pushSessionEvent: ((event: unknown) => void) | undefined;
+        const persistedBodies: Array<{ url: string; body: any }> = [];
+        const internalFetch = vi.fn(async (input: unknown, init?: { body?: string; method?: string }) => {
+          const target = String(input).split("?")[0] ?? "";
+          if (target.endsWith("/internal/bridge/conversations/77")) {
+            return { ok: true, status: 200, json: async () => ({ id: 77, thread_id: "t77" }) };
+          }
+          if (init?.body) {
+            persistedBodies.push({ url: target, body: JSON.parse(init.body ?? "{}") });
+          }
+          return { ok: true, status: 200, json: async () => ({}) };
+        });
+        vi.stubGlobal("fetch", internalFetch);
+        const services = {
+          get: () => ({
+            onDynamicSessionEvent:
+              () =>
+              (cb: (event: unknown) => void): { dispose: () => void } => {
+                pushSessionEvent = cb;
+                queueMicrotask(() => {
+                  pushSessionEvent?.({
+                    type: "session.event",
+                    event: {
+                      type: "model.streaming",
+                      eventId: "evt-d1",
+                      payload: { kind: "text_delta", delta: "半截回答内容" },
+                    },
+                  });
+                  pushSessionEvent?.({
+                    type: "session.event",
+                    event: {
+                      type: "turn.completed",
+                      eventId: "evt-d2",
+                      payload: { resultType: "cancelled" },
+                    },
+                  });
+                });
+                return { dispose: () => {} };
+              },
+            sendConversationCommandV4: async () => ({ status: "accepted" }),
+            closeSession: async () => true,
+            createSession: async () => ({ session: { sessionId: "sess_x" } }),
+            sendPrompt: async () => ({ ok: true }),
+          }),
+          getOptional: () => undefined,
+        } as unknown as Parameters<typeof registerMiaoshouChatRoutes>[1];
+        try {
+          const app = new Hono();
+          registerMiaoshouChatRoutes(app, services);
+          const response = await app.request("/api/agent/chat", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-platform-token": "t",
+              "x-user-id": "42",
+              "x-user-role": "user",
+            },
+            body: JSON.stringify({
+              conversation_id: 77,
+              message: "写一篇文章",
+              run_id: "run_stop_1",
+            }),
+          });
+          const text = await response.text();
+          expect(text).toContain("半截回答内容");
+          expect(text).toContain("生成过程已中断");
+          expect(text).toContain('"type":"done"');
+          const messageWrites = persistedBodies.filter((entry) =>
+            entry.url.endsWith("/internal/bridge/messages"),
+          );
+          expect(messageWrites.length).toBeGreaterThan(0);
+          const assistantWrite = messageWrites.find((entry) => entry.body.role === "assistant");
+          expect(assistantWrite).toBeTruthy();
+          expect(assistantWrite!.body.content).toContain("半截回答内容");
+          expect(assistantWrite!.body.content).toContain("生成过程已中断");
         } finally {
           vi.unstubAllGlobals();
           conversationSessionMap.clear();

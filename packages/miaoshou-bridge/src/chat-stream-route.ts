@@ -660,6 +660,22 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
                     false,
                   );
                 }
+                // 用户停止：把中断标记随半截回答一起落库——否则停止后刷新
+                // 页面，库里只剩提问没有任何痕迹，回答与"已中断"提示双消失
+                if (completion.resultType === "cancelled") {
+                  const markerText = "生成过程已中断，已保留当前已生成内容。";
+                  const alreadyMarked = recordedBlocks.some(
+                    (block) =>
+                      block.type === "text" &&
+                      String(block.content ?? "").includes("生成过程已中断"),
+                  );
+                  if (!alreadyMarked) {
+                    recordedBlocks.push({ type: "text", content: markerText });
+                    accumulator.assistantText = `${accumulator.assistantText}\n\n${markerText}`.trim();
+                    runWriter.markDirty();
+                    writeEvent({ type: "message_delta", content: `\n\n${markerText}` }, true);
+                  }
+                }
                 finalDoneEvent = {
                   type: "done",
                   run_id: runId,
