@@ -28,6 +28,7 @@ import {
   rememberTracked,
   runExecutionRegistry,
   runRegistry,
+  runCancelHandlers,
   type PendingPermission,
 } from "./chat-shared.js";
 import { startSessionIdleSweep } from "./chat-idle-sweep.js";
@@ -464,6 +465,17 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
           },
         });
 
+        // 注册取消熔断回调：当外部 /runs/:id/cancel 到达时，立即由桥接层
+        // 本地切断后续字流并落库终态，不再受制于底层运行时何时确认
+        const handleStop = (): void => {
+          if (settled) return;
+          settled = true;
+          finalDoneEvent = { type: "done", run_id: runId, interrupted: true };
+          finishSignal.resolve();
+        };
+        runCancelHandlers.set(runKey, handleStop);
+        cleanupFns.push(() => runCancelHandlers.delete(runKey));
+
         stream.onAbort(() => {
           // 与 ZCode 官方语义一致：执行属于运行时不依赖客户端连接。
           // 断线只释放并发槽位，本轮继续执行、继续收集事件，
@@ -659,22 +671,6 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
                     },
                     false,
                   );
-                }
-                // 用户停止：把中断标记随半截回答一起落库——否则停止后刷新
-                // 页面，库里只剩提问没有任何痕迹，回答与"已中断"提示双消失
-                if (completion.resultType === "cancelled") {
-                  const markerText = "生成过程已中断，已保留当前已生成内容。";
-                  const alreadyMarked = recordedBlocks.some(
-                    (block) =>
-                      block.type === "text" &&
-                      String(block.content ?? "").includes("生成过程已中断"),
-                  );
-                  if (!alreadyMarked) {
-                    recordedBlocks.push({ type: "text", content: markerText });
-                    accumulator.assistantText = `${accumulator.assistantText}\n\n${markerText}`.trim();
-                    runWriter.markDirty();
-                    writeEvent({ type: "message_delta", content: `\n\n${markerText}` }, true);
-                  }
                 }
                 finalDoneEvent = {
                   type: "done",

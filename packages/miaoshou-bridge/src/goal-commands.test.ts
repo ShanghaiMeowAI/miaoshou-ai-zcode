@@ -403,7 +403,7 @@ describe("用户停止后中断标记落库", () => {
           });
           const text = await response.text();
           expect(text).toContain("半截回答内容");
-          expect(text).toContain("生成过程已中断");
+          expect(text).not.toContain("生成过程已中断");
           expect(text).toContain('"type":"done"');
           const messageWrites = persistedBodies.filter((entry) =>
             entry.url.endsWith("/internal/bridge/messages"),
@@ -411,8 +411,7 @@ describe("用户停止后中断标记落库", () => {
           expect(messageWrites.length).toBeGreaterThan(0);
           const assistantWrite = messageWrites.find((entry) => entry.body.role === "assistant");
           expect(assistantWrite).toBeTruthy();
-          expect(assistantWrite!.body.content).toContain("半截回答内容");
-          expect(assistantWrite!.body.content).toContain("生成过程已中断");
+          expect(assistantWrite!.body.content).toBe("半截回答内容");
         } finally {
           vi.unstubAllGlobals();
           conversationSessionMap.clear();

@@ -15,6 +15,7 @@ import {
   pendingPermissions,
   recordDeniedToolResult,
   rememberTracked,
+  runCancelHandlers,
   runExecutionRegistry,
   runRegistry,
   selectPermissionOption,
@@ -380,7 +381,7 @@ export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
     if (!trackedRun) return c.json({ detail: "运行不存在或已结束" }, 404);
     try {
       const expectedExecutionId = runExecutionRegistry.get(cancelKey);
-      const ack = await deps.rawAgentService.sendConversationCommandV4({
+      await deps.rawAgentService.sendConversationCommandV4({
         workspacePath: deps.workspacePath,
         envelope: buildCommandEnvelope(
           "stop",
@@ -388,16 +389,19 @@ export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
           trackedRun.sessionId,
         ),
       });
-      const result = isCommandAckOk(ack);
-      if (!result.ok) {
-        return c.json({ detail: result.error ?? "停止命令被拒绝" }, 500);
+    } catch {
+      // 底层命令下发失败不阻断本地熔断
+    } finally {
+      // 对齐 OpenWebUI：立即在桥接层执行流熔断与落库收尾，
+      // 关掉事件总线、落库已输出正文、向客户端发 done，绝不让字继续往外冒
+      const stopHandler = runCancelHandlers.get(cancelKey);
+      if (stopHandler) {
+        stopHandler();
       }
       runRegistry.delete(cancelKey);
       runExecutionRegistry.delete(cancelKey);
-      return c.json({ success: true });
-    } catch (error) {
-      return c.json({ detail: error instanceof Error ? error.message : "取消失败" }, 500);
     }
+    return c.json({ success: true });
   };
 
   // ── 状态记录（旧前端契约保留）：POST /api/agent/conversations/:id/runs/:runId/interrupted

@@ -73,6 +73,10 @@ export interface PendingPermission {
 export const conversationSessionMap = new Map<string, TrackedConversation>();
 export const runRegistry = new Map<string, TrackedConversation>();
 export const runExecutionRegistry = new Map<string, string>();
+/** 取消回调注册表：chat 流启动时登记，/runs/:id/cancel 命中后由桥接层
+ *  主动收尾（保留已生成正文、写运行终态、关闭事件总线），不再依赖
+ *  runtime 是否发出 turn.completed(cancelled)。 */
+export const runCancelHandlers = new Map<string, () => void>();
 export const pendingPermissions = new Map<string, PendingPermission>();
 
 /**
