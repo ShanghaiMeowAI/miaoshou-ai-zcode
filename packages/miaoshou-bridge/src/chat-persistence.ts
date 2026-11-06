@@ -27,6 +27,8 @@ export interface TurnPersistInput {
   conversationId: number;
   isResume: boolean;
   message: string;
+  /** 落库展示用消息（如带附件轮次的用户可见文本）；缺省回落 message */
+  displayMessage?: string;
   assistantText: string;
   recordedBlocks: Array<Record<string, unknown>>;
   /** 用户消息已在流开始时落库成功：收尾只补助手消息，不再重复写用户行 */
@@ -63,6 +65,9 @@ export function bootstrapTurnPersistence(params: {
   userId: string;
   getBlocks: () => Array<Record<string, unknown>>;
   message: string;
+  /** 落库展示用消息：带附件轮次给模型的是文档上下文、给用户看的
+   *  是简短可见文本，落库必须用后者，否则历史回显整段文档全文 */
+  displayMessage?: string;
   isResume: boolean;
 }): TurnStreamBootstrap {
   const runWriter = createRunSnapshotWriter({
@@ -74,7 +79,10 @@ export function bootstrapTurnPersistence(params: {
   runWriter.start();
   const userMessagePersisted =
     !params.isResume && params.conversationId !== undefined
-      ? persistChatUserMessage(params.conversationId, params.message)
+      ? persistChatUserMessage(
+          params.conversationId,
+          params.displayMessage ?? params.message,
+        )
       : undefined;
   return { runWriter, userMessagePersisted };
 }
@@ -88,6 +96,7 @@ export async function persistChatTurn(params: {
   conversationId: number;
   isResume: boolean;
   message: string;
+  displayMessage?: string;
   assistantText: string;
   recordedBlocks: Array<Record<string, unknown>>;
   userMessagePersisted?: Promise<boolean>;
@@ -98,6 +107,7 @@ export async function persistChatTurn(params: {
       conversationId: params.conversationId,
       isResume: params.isResume,
       message: params.message,
+      displayMessage: params.displayMessage,
       assistantText: params.assistantText,
       recordedBlocks: params.recordedBlocks,
       userAlreadyPersisted: (await params.userMessagePersisted) === true,
@@ -121,7 +131,7 @@ export function persistTurnResult(input: TurnPersistInput): Promise<boolean> {
     // resume 轮的用户动作已在流开始时单独落库；聊天/编辑轮的用户消息
     // 也在流开始时即时落库（失败时收尾补写），此处只补助手消息
     if (!input.isResume && !input.userAlreadyPersisted) {
-      messages.push({ role: "user", content: input.message });
+      messages.push({ role: "user", content: input.displayMessage ?? input.message });
     }
     if (input.assistantText || input.recordedBlocks.length > 0) {
       messages.push({

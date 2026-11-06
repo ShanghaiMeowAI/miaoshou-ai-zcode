@@ -130,6 +130,12 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
       return c.json({ detail: "请求体无效" }, 400);
     }
     const message = typeof body.message === "string" ? body.message : "";
+    // 带附件轮次：message 是文档上下文（给模型），display_message 是用户
+    // 可见文本（给落库与标题）；旧链路同名字段的语义，前端零适配
+    const displayMessage =
+      typeof body.display_message === "string" && body.display_message.trim()
+        ? body.display_message
+        : message;
     const { conversation_id } = body;
     const resumePayload = body.resume;
     let isResume = Boolean(resumePayload && typeof resumePayload === "object");
@@ -165,7 +171,7 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
     const bridgeConversation = await resolveBridgeConversation(
       identity.userId,
       conversation_id,
-      message,
+      displayMessage,
       isResume,
     );
     const clientConvId = bridgeConversation
@@ -422,6 +428,7 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
           userId: identity.userId,
           getBlocks: () => recordedBlocks,
           message,
+          displayMessage,
           isResume,
         });
         cleanupFns.push(() => runWriter.dispose());
@@ -810,6 +817,7 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
             conversationId: tracked.conversationId,
             isResume,
             message,
+            displayMessage,
             assistantText: accumulator.assistantText,
             recordedBlocks,
             userMessagePersisted,
