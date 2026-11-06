@@ -122,10 +122,14 @@ export async function createBridgeConversation(
   title: string,
 ): Promise<BridgeConversation | undefined> {
   const threadId = randomUUID();
+  // 平台侧 title 校验上限 200（bridge_internal.py BridgeConversationCreate），
+  // 且校验发生在平台截断（[:40]）之前；首条消息全文作标题传入时超长会被
+  // 422 拒绝，导致会话无法落库、刷新即丢。此处先行截断，杜绝 422 分支。
+  const safeTitle = title.length > 120 ? title.slice(0, 120) : title;
   const result = await internalPost("/internal/bridge/conversations", {
     user_id: userId,
     thread_id: threadId,
-    title,
+    title: safeTitle,
   });
   const conversation = parseBridgeConversation(result);
   if (!conversation) return undefined;
