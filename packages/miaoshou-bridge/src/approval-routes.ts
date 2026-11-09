@@ -21,7 +21,7 @@ import {
   selectPermissionOption,
   type PendingPermission,
 } from "./chat-shared.js";
-import { extractMiaoshouIdentity } from "./index.js";
+import { extractMiaoshouIdentity, rememberUserToken } from "./index.js";
 
 export interface ApprovalAgentLike {
   sendConversationCommandV4(params: { workspacePath: string; envelope: unknown }): Promise<unknown>;
@@ -314,6 +314,9 @@ export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
   const handleInterrupt = async (c: any) => {
     const identity = extractMiaoshouIdentity(c.req.raw.headers);
     if (!identity) return c.json({ detail: "未登录" }, 401);
+    if (identity.authorization) {
+      rememberUserToken(Number(identity.userId), identity.authorization);
+    }
     sweepExpiredPending();
     const permission = pendingPermissions.get(c.req.param("interruptId"));
     if (!permission) return c.json({ detail: "审批请求不存在或已处理" }, 404);
@@ -376,6 +379,9 @@ export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
   const handleCancel = async (c: any) => {
     const identity = extractMiaoshouIdentity(c.req.raw.headers);
     if (!identity) return c.json({ detail: "未登录" }, 401);
+    if (identity.authorization) {
+      rememberUserToken(Number(identity.userId), identity.authorization);
+    }
     const cancelKey = `${identity.userId}:${c.req.param("runId")}`;
     const trackedRun = runRegistry.get(cancelKey);
     if (!trackedRun) return c.json({ detail: "运行不存在或已结束" }, 404);

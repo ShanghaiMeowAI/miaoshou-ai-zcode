@@ -6,6 +6,8 @@ import {
   clearSessionOwner,
   extractMiaoshouIdentity,
   registerSessionOwner,
+  rememberUserToken,
+  getUserToken,
 } from "./index.js";
 
 import {
@@ -129,6 +131,9 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
     const identity = extractMiaoshouIdentity(c.req.raw.headers);
     if (!identity) {
       return c.json({ detail: "未登录或缺少身份凭证（需网关注入的 X-User-ID）" }, 401);
+    }
+    if (identity.authorization) {
+      rememberUserToken(Number(identity.userId), identity.authorization);
     }
 
     const body = await c.req.json().catch(() => null);
@@ -929,4 +934,32 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
   });
 
   registerApprovalRoutes(app, { workspacePath, rawAgentService });
+
+  // ── 内部凭据换发端点：供本地回环的 quant MCP 动态拉取用户最新 token ──
+  app.get("/internal/bridge/user-token", (c) => {
+    const internalSecret =
+      process.env.QUANT_MCP_INTERNAL_SECRET || process.env.MIAOSHOU_QUANT_INTERNAL_SECRET;
+    const suppliedSecret =
+      c.req.header("x-internal-secret") ||
+      c.req.header("x-platform-token") ||
+      "";
+    if (internalSecret && suppliedSecret !== internalSecret) {
+      return c.json({ ok: false, detail: "unauthorized" }, 401);
+    }
+    const rawUserId = c.req.query("user_id");
+    const userId = Number(rawUserId);
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return c.json({ ok: false, detail: "invalid_user_id" }, 400);
+    }
+    const cached = getUserToken(userId);
+    if (!cached) {
+      return c.json({ ok: false, detail: "token_not_found" }, 404);
+    }
+    return c.json({
+      ok: true,
+      user_id: userId,
+      authorization: cached.token,
+      updated_at: cached.updatedAt,
+    });
+  });
 }

@@ -447,3 +447,10 @@ export function wrapZCodeSessionServiceWithIdentity<T extends object>(
 
 // 聊天路由从子路径导出（@miaoshou/bridge/chat-stream），避免 index 与
 // chat-stream-route 形成循环依赖；身份与包装能力仍从主入口导出。
+export {
+  rememberUserToken,
+  getUserToken,
+  clearUserTokens,
+  type CachedUserToken,
+} from "./token-registry.js";
+

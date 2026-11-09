@@ -31,7 +31,7 @@ import { handlePermissionRequestedEvent, resolvePermissionWith } from "./approva
 import { createRunSnapshotWriter } from "./chat-run-sync.js";
 import { attachTurnHub } from "./chat-turn-hub.js";
 import { awaitTurnPersist, persistChatUserMessage, persistTurnResult } from "./chat-persistence.js";
-import type { MiaoshouUserIdentity } from "./index.js";
+import { type MiaoshouUserIdentity, rememberUserToken } from "./index.js";
 
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const MAX_QUEUED_DELTA_BYTES = 512 * 1024;
@@ -250,6 +250,9 @@ export async function handleMessageCommand(
   const identity = deps.extractIdentity(c.req.raw.headers);
   if (!identity) {
     return c.json({ detail: "未登录或缺少身份凭证（需网关注入的 X-User-ID）" }, 401);
+  }
+  if (identity.authorization) {
+    rememberUserToken(Number(identity.userId), identity.authorization);
   }
   const messageId = Number(c.req.param("messageId"));
   if (!Number.isInteger(messageId) || messageId <= 0) {

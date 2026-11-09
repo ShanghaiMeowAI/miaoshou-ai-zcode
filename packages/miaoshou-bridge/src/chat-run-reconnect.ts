@@ -6,13 +6,16 @@
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { HEARTBEAT_INTERVAL_MS } from "./chat-shared.js";
-import { extractMiaoshouIdentity } from "./index.js";
+import { extractMiaoshouIdentity, rememberUserToken } from "./index.js";
 import { getTurnHub } from "./chat-turn-hub.js";
 
 export function registerRunReconnectRoutes(app: Hono): void {
   const handleRunStreamReconnect = async (c: any) => {
     const identity = extractMiaoshouIdentity(c.req.raw.headers);
     if (!identity) return c.json({ detail: "未登录" }, 401);
+    if (identity.authorization) {
+      rememberUserToken(Number(identity.userId), identity.authorization);
+    }
     const runId = c.req.param("runId");
     const entry = getTurnHub(runId);
     if (!entry || entry.userId !== identity.userId) {
