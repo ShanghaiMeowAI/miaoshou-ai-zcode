@@ -6,10 +6,8 @@ import type { Hono } from "hono";
 import {
   MAX_RUNS_PER_USER,
   PENDING_PERMISSION_TTL_MS,
-  QUANT_MUTATION_TOOLS,
-  QUANT_READONLY_TOOLS,
+  QUANT_ALLOWED_TOOLS,
   buildCommandEnvelope,
-  eventToolName,
   isCommandAckOk,
   normalizeQuantToolName,
   pendingPermissions,
@@ -19,6 +17,7 @@ import {
   runExecutionRegistry,
   runRegistry,
   selectPermissionOption,
+  structuredFailureContent,
   type PendingPermission,
 } from "./chat-shared.js";
 import { extractMiaoshouIdentity, rememberUserToken } from "./index.js";
@@ -116,13 +115,9 @@ export function buildPendingPermission(params: {
   if (typeof params.request.toolCallId === "string" && params.request.toolCallId) {
     permission.toolCallId = params.request.toolCallId;
   }
-  // 妙手量化平台不是交互式编程 harness:回测/保存等量化操作由 AI 直接执行,
-  // 不需要用户逐次批准(产品决策:完全授权)。未知的非量化工具仍一律拒绝。
-  const disposition: PermissionDisposition = QUANT_READONLY_TOOLS.has(toolName)
+  const disposition: PermissionDisposition = QUANT_ALLOWED_TOOLS.has(toolName)
     ? "auto_approve"
-    : QUANT_MUTATION_TOOLS.has(toolName)
-      ? "auto_approve"
-      : "reject";
+    : "reject";
   return { permission, disposition, toolName };
 }
 /** 挂起审批下发给前端的 interrupt 事件载荷（旧前端契约：固定双选项、不可自定义）。 */
@@ -284,13 +279,16 @@ export function handlePermissionRequestedEvent(params: {
     console.warn(
       `[miaoshou-bridge] 工具 ${toolName} 未登记量化白名单，自动拒绝（requestId=${request.requestId}）`,
     );
-    const deniedContent = "该工具调用已被拒绝：未登记的量化工具，未执行。";
+    const deniedContent = structuredFailureContent(
+      "blocked",
+      "该工具调用已被拒绝：未登记的量化工具，未执行。",
+    );
     if (permission.toolCallId) {
       params.hooks.writeEvent(
         {
           type: "tool_result",
           id: permission.toolCallId,
-          name: eventToolName(toolName),
+          name: toolName,
           ok: false,
           content: deniedContent,
         },

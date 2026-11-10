@@ -471,11 +471,23 @@ describe("registerMiaoshouChatRoutes 审批与回放", () => {
         registeredToolNames: new Map(),
         writeEvent: () => {},
       });
-      // runtime 新名 backtest_run + 结果含 run_id/strategy_id
       handleSessionEvent(
         makeEvent(
           "call_bt_1",
-          '{"ok":true,"status":"success","run_id":10506,"strategy_id":330}',
+          JSON.stringify({
+            ok: true,
+            status: "success",
+            run_id: 10506,
+            strategy_id: 330,
+            artifact: {
+              type: "artifact",
+              artifact_type: "backtest_run",
+              run_id: 10506,
+              strategy_id: 330,
+              url: "/strategy/backtest-runs/10506",
+              title: "回测详情 #10506",
+            },
+          }),
         ) as never,
       );
       const artifact = recorded.find((block) => block.type === "artifact");

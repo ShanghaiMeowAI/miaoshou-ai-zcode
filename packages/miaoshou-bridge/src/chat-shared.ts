@@ -8,6 +8,7 @@ import type { CommandEnvelope } from "@zcode/shared/zcode-protocol-v4";
 // mcp__ 前缀剥不掉，全部量化工具被误判为"非量化工具"静默拒绝
 import { sanitizeMcpAppsModelNamePart } from "@zcode/shared/mcp-apps";
 import { quantServerName } from "./index.js";
+import { getQuantToolTitle } from "./quant-tool-titles.js";
 
 export const MAX_TRACKED_PER_USER = 100;
 export const MAX_RUNS_PER_USER = 20;
@@ -26,21 +27,19 @@ export const DEFAULT_WORKSPACE_PATH = process.cwd();
 // 此处 re-export 保持聊天路由的既有导入路径不变
 export { SESSION_TOOL_DENYLIST } from "./index.js";
 
-/** 只读量化工具：权限请求到达时由服务端自动放行 */
-export const QUANT_READONLY_TOOLS = new Set([
+/** 量化白名单工具：权限请求到达时由服务端自动放行 */
+export const QUANT_ALLOWED_TOOLS = new Set([
   "strategy_list_and_query",
   "strategy_get_detail",
   "strategy_compose_and_verify",
+  "strategy_save",
   "catalog_search_indicators",
   "catalog_get_industries",
   "formula_compose_and_check",
+  "backtest_run",
   "backtest_get_analysis",
-  // 回测结束日期的强制来源：策略工具描述要求模型必须先调它取交易日，
-  // 漏登记会让每次回测前的查询被自动拒绝，模型只能反复向用户要日期
   "market_get_latest_trade_date",
 ]);
-/** 写操作量化工具：必须经用户在界面上确认 */
-export const QUANT_MUTATION_TOOLS = new Set(["strategy_save", "backtest_run"]);
 
 export interface TrackedConversation {
   userId: string;
@@ -153,7 +152,11 @@ export function recordDeniedToolResult(
 ): void {
   if (!toolCallId) return;
   const list = deniedToolResults.get(sessionId) ?? [];
-  list.push({ toolCallId, toolName, content: "用户取消了该操作，未执行。" });
+  list.push({
+    toolCallId,
+    toolName,
+    content: structuredFailureContent("blocked", "用户取消了该操作，未执行。"),
+  });
   while (list.length > DENIED_TOOL_RESULTS_PER_SESSION) list.shift();
   deniedToolResults.set(sessionId, list);
 }
@@ -265,26 +268,6 @@ export function selectPermissionOption(
 }
 
 /**
- * 新工具名 → 平台前端旧词汇表的兼容映射：前端的回测产物识别、工具标签
- * 仍按旧名匹配（如 create_strategy_backtest），事件下发前先映射。
- */
-const EVENT_TOOL_NAME_ALIASES: Record<string, string> = {
-  backtest_run: "create_strategy_backtest",
-  backtest_get_analysis: "get_backtest_run_data",
-  strategy_get_detail: "get_strategy_detail",
-  strategy_compose_and_verify: "compile_strategy",
-  strategy_save: "save_strategy_draft",
-  catalog_search_indicators: "get_system_indicator_catalog",
-  catalog_get_industries: "get_industry_standard_catalog",
-  formula_compose_and_check: "compose_indicator_formula",
-  strategy_list_and_query: "list_strategies",
-};
-
-export function eventToolName(toolName: string): string {
-  return EVENT_TOOL_NAME_ALIASES[toolName] ?? toolName;
-}
-
-/**
  * 自动拒绝的落库收尾：终态写进已发出的卡片；scheduled 事件缺席的少数工具
  * 没有可匹配的卡片，补记一张带结果的失败卡。不带 result 的卡片会被平台
  * 读取接口按旧契约过滤（刷新后消失），聊天流与命令流共用同一实现。
@@ -302,12 +285,25 @@ export function applySyntheticToolResult(
       return;
     }
   }
+  const title = getQuantToolTitle(toolName);
   recordedBlocks.push({
     type: "tool_call",
     id: toolCallId,
-    name: eventToolName(toolName),
+    name: toolName,
+    ...(title ? { title } : {}),
     result: content,
   });
+}
+
+/**
+ * 失败/拦截类工具结果的结构化正文：前端解析 JSON 字段判定状态并提取
+ * 中文原因，不依赖任何文本标记匹配。
+ */
+export function structuredFailureContent(
+  status: "failed" | "blocked",
+  message: string,
+): string {
+  return JSON.stringify({ ok: false, status, message });
 }
 
 export function normalizeQuantToolName(toolName: string): string {
@@ -339,7 +335,7 @@ export function buildToolResultPayload(params: {
     | undefined;
   let content: string;
   if (params.kind === "error") {
-    content = `工具执行失败：${params.errorMessage ?? "未知错误"}`;
+    content = structuredFailureContent("failed", params.errorMessage ?? "未知错误");
   } else if (typeof rawResult === "string") {
     content = rawResult;
   } else if (Array.isArray(rawResult?.content)) {
@@ -373,7 +369,7 @@ export function buildToolResultPayload(params: {
   return {
     type: "tool_result",
     id: params.toolCallId,
-    name: eventToolName(params.toolName),
+    name: params.toolName,
     ok,
     content,
   };

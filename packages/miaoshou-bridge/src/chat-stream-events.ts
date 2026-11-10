@@ -7,9 +7,9 @@ import {
   ASSISTANT_TEXT_MAX,
   MAX_QUEUED_DELTA_BYTES,
   buildToolResultPayload,
-  eventToolName,
   normalizeQuantToolName,
 } from "./chat-shared.js";
+import { getQuantToolTitle } from "./quant-tool-titles.js";
 
 export interface StreamAccumulator {
   assistantText: string;
@@ -44,50 +44,23 @@ export function dropDeltaWhenOverflow(params: {
   return true;
 }
 
-/** 回测类工具：runtime 发新名(如 backtest_run)，前端词汇表用旧名
- *  (create_strategy_backtest)。两套名字都要认，否则 artifact 不生成。 */
-const BACKTEST_TOOL_NAMES = new Set([
-  "create_strategy_backtest",
-  "create_backtest_run",
-  "run_backtest",
-  "backtest_run",
-]);
-
-function isBacktestToolName(toolName: string): boolean {
-  return BACKTEST_TOOL_NAMES.has(toolName);
-}
-
-/** 从回测工具结果文本提取 run_id(与前端证据判定同口径)。 */
-function extractBacktestRunId(text: string): number | undefined {
-  const match = /\brun_id["']?\s*[:：]\s*["']?(\d+)/.exec(text);
-  const runId = match ? Number(match[1]) : NaN;
-  return Number.isInteger(runId) && runId > 0 ? runId : undefined;
-}
-
-function extractStrategyId(text: string): number | undefined {
-  const match = /\bstrategy_id["']?\s*[:：]\s*["']?(\d+)/.exec(text);
-  const strategyId = match ? Number(match[1]) : NaN;
-  return Number.isInteger(strategyId) && strategyId > 0 ? strategyId : undefined;
-}
-
-/** 旧链路的 artifact 结构,前端 normalizeBacktestArtifact 渲染为可点击详情。 */
-function backtestArtifactFromResult(
+/** 从工具结果 JSON 中直接读取 artifact 对象。 */
+export function extractArtifactFromResult(
   toolCallId: string,
   resultText: string,
 ): Record<string, unknown> | undefined {
-  const runId = extractBacktestRunId(resultText);
-  if (runId === undefined) return undefined;
-  const artifact: Record<string, unknown> = {
-    type: "artifact",
-    artifact_type: "backtest_run",
-    run_id: runId,
-    url: `/strategy/backtest-runs/${runId}`,
-    title: `回测详情 #${runId}`,
-    toolCallId,
-  };
-  const strategyId = extractStrategyId(resultText);
-  if (strategyId !== undefined) artifact.strategy_id = strategyId;
-  return artifact;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(resultText);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object") return undefined;
+  const record = parsed as Record<string, unknown>;
+  if (record.artifact && typeof record.artifact === "object") {
+    return { ...(record.artifact as Record<string, unknown>), toolCallId };
+  }
+  return undefined;
 }
 
 /** 处理单个 session.event。返回 true 表示事件已被本函数消费。 */
@@ -157,6 +130,9 @@ export function handleSessionEvent(params: {
       const toolName =
         params.registeredToolNames.get(toolPayload.toolCallId) ??
         normalizeQuantToolName(toolPayload.toolName ?? "");
+      // 中文标题来自工具所有者的 tools/list 声明（quant-tool-titles 缓存），
+      // 前端状态行直接渲染，不再按工具名查本地字典
+      const toolTitle = getQuantToolTitle(toolName);
       // 协议对同一 toolCallId 先后投递 scheduled 与 started 两个事件，
       // 只发一次 tool_call，避免前端出现重复的“执行中”卡片；
       // 审批前那条流已发过挂起工具的卡片，恢复流不再重复下发，
@@ -168,7 +144,8 @@ export function handleSessionEvent(params: {
         params.recordedBlocks.push({
           type: "tool_call",
           id: toolPayload.toolCallId,
-          name: eventToolName(toolName),
+          name: toolName,
+          ...(toolTitle ? { title: toolTitle } : {}),
           args: toolPayload.input,
         });
         return true;
@@ -177,14 +154,16 @@ export function handleSessionEvent(params: {
       params.recordedBlocks.push({
         type: "tool_call",
         id: toolPayload.toolCallId,
-        name: eventToolName(toolName),
+        name: toolName,
+        ...(toolTitle ? { title: toolTitle } : {}),
         args: toolPayload.input,
       });
       params.writeEvent(
         {
           type: "tool_call",
           id: toolPayload.toolCallId,
-          name: eventToolName(toolName),
+          name: toolName,
+          ...(toolTitle ? { title: toolTitle } : {}),
           args: toolPayload.input,
         },
         false,
@@ -209,18 +188,21 @@ export function handleSessionEvent(params: {
       // 前端按 id 配对，补发缺失的 tool_call；同时补记卡片（带结果），
       // 否则刷新后这一轮的工具卡片全部消失
       if (toolPayload.toolCallId && !params.emittedToolCalls.has(toolPayload.toolCallId)) {
+        const lateTitle = getQuantToolTitle(toolName);
         params.emittedToolCalls.add(toolPayload.toolCallId);
         params.recordedBlocks.push({
           type: "tool_call",
           id: toolPayload.toolCallId,
-          name: eventToolName(toolName),
+          name: toolName,
+          ...(lateTitle ? { title: lateTitle } : {}),
           result: trPayload.content,
         });
         params.writeEvent(
           {
             type: "tool_call",
             id: toolPayload.toolCallId,
-            name: eventToolName(toolName),
+            name: toolName,
+            ...(lateTitle ? { title: lateTitle } : {}),
           },
           false,
         );
@@ -232,15 +214,17 @@ export function handleSessionEvent(params: {
           break;
         }
       }
-      // 回测类工具完成后从结果提取 run_id,落一个可点击的回测详情卡片
-      // (与旧链路的 artifact 结构一致,前端渲染为右侧详情入口)
-      if (isBacktestToolName(toolName) && toolPayload.toolCallId && trPayload.ok !== false) {
-        const artifact = backtestArtifactFromResult(toolPayload.toolCallId, trPayload.content);
+      if (toolPayload.toolCallId && trPayload.ok !== false) {
+        const artifact = extractArtifactFromResult(
+          toolPayload.toolCallId,
+          trPayload.content,
+        );
         const alreadyRecorded = params.recordedBlocks.some(
           (b) => b.type === "artifact" && b.toolCallId === toolPayload.toolCallId,
         );
         if (artifact && !alreadyRecorded) {
           params.recordedBlocks.push(artifact);
+          params.writeEvent(artifact, false);
         }
       }
       params.writeEvent(trPayload, false);

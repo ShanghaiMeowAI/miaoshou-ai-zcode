@@ -3,7 +3,8 @@
  * 动作即时落库、被拒工具的终态卡片补发。从 chat-stream-route 拆出以守住
  * 单文件行数门禁。
  */
-import { drainDeniedToolResults, enqueueConversationWrite, eventToolName } from "./chat-shared.js";
+import { drainDeniedToolResults, enqueueConversationWrite } from "./chat-shared.js";
+import { getQuantToolTitle } from "./quant-tool-titles.js";
 import { appendBridgeMessages } from "./bridge-internal-client.js";
 import { createRunSnapshotWriter, type RunSnapshotWriter } from "./chat-run-sync.js";
 
@@ -179,10 +180,12 @@ export function replayDeniedToolResults(
 ): void {
   for (const denied of drainDeniedToolResults(sessionId)) {
     emittedToolCalls.add(denied.toolCallId);
+    const deniedTitle = getQuantToolTitle(denied.toolName);
     recordedBlocks.push({
       type: "tool_call",
       id: denied.toolCallId,
-      name: eventToolName(denied.toolName),
+      name: denied.toolName,
+      ...(deniedTitle ? { title: deniedTitle } : {}),
       result: denied.content,
     });
     writeEvent(

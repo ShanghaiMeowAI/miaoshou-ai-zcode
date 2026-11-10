@@ -13,7 +13,6 @@ import {
 import {
   DEFAULT_WORKSPACE_PATH,
   HEARTBEAT_INTERVAL_MS,
-  MAX_QUEUED_DELTA_BYTES,
   MAX_CONCURRENT_STREAMS_PER_USER,
   MAX_RUNS_PER_USER,
   MAX_TRACKED_PER_USER,
@@ -23,7 +22,6 @@ import {
   consumeSessionEventId,
   conversationSessionMap,
   createProjectIdResolver,
-  eventToolName,
   pendingPermissions,
   occupyStreamSlot,
   recordDeniedToolResult,
@@ -31,8 +29,10 @@ import {
   runExecutionRegistry,
   runRegistry,
   runCancelHandlers,
+  structuredFailureContent,
   type PendingPermission,
 } from "./chat-shared.js";
+import { getQuantToolTitle, primeQuantToolTitles } from "./quant-tool-titles.js";
 import { startSessionIdleSweep } from "./chat-idle-sweep.js";
 import { createRowServiceCache, resolveTurnEntityId } from "./chat-row-query.js";
 import { attachTurnHub } from "./chat-turn-hub.js";
@@ -56,7 +56,6 @@ import {
   bootstrapTurnPersistence,
   persistChatTurn,
   persistResumeUserAction,
-  persistTurnResult,
   replayDeniedToolResults,
 } from "./chat-persistence.js";
 import {
@@ -135,6 +134,9 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
     if (identity.authorization) {
       rememberUserToken(Number(identity.userId), identity.authorization);
     }
+    // 工具标题预热：从 quant MCP 的 tools/list 拉取中文名（缓存为空时才拉），
+    // 保证首个 tool_call 事件下发时标题已就绪
+    primeQuantToolTitles(identity.userId);
 
     const body = await c.req.json().catch(() => null);
     if (!body) {
@@ -779,18 +781,25 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
               const deniedToolCallId = pendingResolution.permission.toolCallId;
               if (deniedToolCallId) {
                 emittedToolCalls.add(deniedToolCallId);
+                const deniedToolName = pendingResolution.permission.toolName;
+                const cancelContent = structuredFailureContent(
+                  "blocked",
+                  "用户取消了该操作，未执行。",
+                );
+                const deniedTitle = getQuantToolTitle(deniedToolName);
                 recordedBlocks.push({
                   type: "tool_call",
                   id: deniedToolCallId,
-                  name: eventToolName(pendingResolution.permission.toolName),
-                  result: "用户取消了该操作，未执行。",
+                  name: deniedToolName,
+                  ...(deniedTitle ? { title: deniedTitle } : {}),
+                  result: cancelContent,
                 });
                 writeEvent(
                   {
                     type: "tool_result",
                     id: deniedToolCallId,
                     ok: false,
-                    content: "用户取消了该操作，未执行。",
+                    content: cancelContent,
                   },
                   false,
                 );
