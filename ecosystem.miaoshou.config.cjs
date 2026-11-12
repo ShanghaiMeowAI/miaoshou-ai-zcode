@@ -16,7 +16,7 @@ module.exports = {
       instances: 1,
       watch: false,
       autorestart: true,
-      max_memory_restart: "512M",
+      max_memory_restart: "1024M",
       kill_timeout: 10000,
       env: {
         PORT: "3030",
