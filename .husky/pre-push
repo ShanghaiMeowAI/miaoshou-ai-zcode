@@ -13,4 +13,10 @@ fi
 # shellcheck disable=SC2046
 unset $(git rev-parse --local-env-vars)
 # 修复原因：强制 mise 会阻止已用其他方式准备好 Node/pnpm 的开发者推送；沿用当前环境。
+# VS Code 等 GUI 方式启动的 Git 进程不加载 ~/.zshrc，PATH 里没有 nvm 的 bin 目录，
+# 钩子会报 pnpm: command not found；仅在环境中找不到 pnpm 且装有 nvm 时才补加载。
+if ! command -v pnpm >/dev/null 2>&1 && [ -s "$HOME/.nvm/nvm.sh" ]; then
+  . "$HOME/.nvm/nvm.sh"
+  nvm use --silent >/dev/null 2>&1
+fi
 ZCODE_PRE_PUSH_STDIN="$pre_push_stdin" pnpm run verify:pre-push
