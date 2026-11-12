@@ -210,6 +210,79 @@ describe("chat history commands", () => {
     expect(commandCalls[0]!.payload.target).toEqual({ rowId: 2, entityId: "a1" });
   });
 
+  it("无回复的用户提问可重试：重跑权威可重试行且截断保留提问行", async () => {
+    const fetchCalls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: unknown) => {
+        const url = String(input);
+        fetchCalls.push(url);
+        if (url.includes("/internal/bridge/messages/4042?")) {
+          return new Response(
+            JSON.stringify({
+              id: 4042,
+              conversation_id: 5,
+              role: "user",
+              content: "复刻下这个策略",
+              is_last: true,
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.includes("/internal/bridge/conversations/5")) {
+          return new Response(JSON.stringify({ id: 5, thread_id: "sess-1" }), { status: 200 });
+        }
+        return new Response("{}", { status: 200 });
+      }),
+    );
+    const { deps, commandCalls, hasEventHandler, fireSessionEvent } = makeDeps();
+    const promise = handleMessageCommand(jsonContext("4042"), deps, { mode: "retry" });
+    await vi.waitFor(() => expect(hasEventHandler()).toBe(true));
+    fireSessionEvent({
+      type: "turn.completed",
+      eventId: globalThis.crypto.randomUUID(),
+    });
+    const response = await promise;
+    expect(response.status).toBe(200);
+    expect(commandCalls[0]!.payload.target).toEqual({ rowId: 2, entityId: "a1" });
+    await vi.waitFor(() =>
+      expect(
+        fetchCalls.some(
+          (u) => u.includes("/messages/4042/trailing") && u.includes("keep_target=1"),
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it("用户提问已有回复（非末条）时拒绝以提问为目标的重试", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: unknown) => {
+        const url = String(input);
+        if (url.includes("/internal/bridge/messages/4042?")) {
+          return new Response(
+            JSON.stringify({
+              id: 4042,
+              conversation_id: 5,
+              role: "user",
+              content: "复刻下这个策略",
+              is_last: false,
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.includes("/internal/bridge/conversations/5")) {
+          return new Response(JSON.stringify({ id: 5, thread_id: "sess-1" }), { status: 200 });
+        }
+        return new Response("{}", { status: 200 });
+      }),
+    );
+    const { deps, commandCalls } = makeDeps();
+    const response = await handleMessageCommand(jsonContext("4042"), deps, { mode: "retry" });
+    expect(response.status).toBe(409);
+    expect(commandCalls).toHaveLength(0);
+  });
+
   it("映射缺失且未标记末条时明确拒绝，不再猜行", async () => {
     const { deps, commandCalls } = makeDeps();
     const response = await handleMessageCommand(jsonContext("123"), deps, { mode: "retry" });

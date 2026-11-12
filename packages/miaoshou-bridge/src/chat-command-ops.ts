@@ -78,6 +78,8 @@ interface PlatformMessage {
   role: string;
   content: string;
   extra?: Record<string, unknown> | null;
+  /** 会话末条标记：崩溃轮重试以"无回复的用户提问"为目标时服务端据此校验 */
+  is_last?: boolean;
 }
 
 async function fetchPlatformMessage(
@@ -127,12 +129,13 @@ async function truncateFromMessage(
   conversationId: number,
   messageId: number,
   userId: string,
+  keepTarget = false,
 ): Promise<void> {
   const secret = internalSecret();
   if (!secret) return;
   try {
     const response = await fetch(
-      `${internalBaseUrl()}/internal/bridge/messages/${messageId}/trailing?user_id=${encodeURIComponent(userId)}`,
+      `${internalBaseUrl()}/internal/bridge/messages/${messageId}/trailing?user_id=${encodeURIComponent(userId)}${keepTarget ? "&keep_target=1" : ""}`,
       {
         method: "DELETE",
         signal: AbortSignal.timeout(5000),
@@ -265,8 +268,14 @@ export async function handleMessageCommand(
   if (!platformMessage) {
     return c.json({ detail: "消息不存在或无法读取" }, 404);
   }
-  if (args.mode === "retry" && platformMessage.role !== "assistant") {
+  // 崩溃/中断轮没有已落库的助手回复：允许以"会话末条用户提问"为重试
+  // 目标，运行时按权威可重试行重跑该轮，提问保留、只替换回复
+  const danglingUserRetry = args.mode === "retry" && platformMessage.role === "user";
+  if (args.mode === "retry" && platformMessage.role !== "assistant" && !danglingUserRetry) {
     return c.json({ detail: "只能重试助手回复" }, 400);
+  }
+  if (danglingUserRetry && platformMessage.is_last !== true) {
+    return c.json({ detail: "该提问已有回复，请对回复发起重试" }, 409);
   }
   if (args.mode === "edit" && platformMessage.role !== "user") {
     return c.json({ detail: "只能编辑用户提问" }, 400);
@@ -296,10 +305,12 @@ export async function handleMessageCommand(
     return c.json({ detail: "该会话的历史轮次无法恢复（运行时未保留），请直接发送新消息" }, 409);
   }
   // 前端确认目标是最后一条时带 last=1：运行时的动作许可只发给最新一轮，
-  // 这条标记允许在文本失步时直接采用运行时的权威可操作行
-  const allowLatestFallback = c.req.query("last") === "1";
+  // 这条标记允许在文本失步时直接采用运行时的权威可操作行。
+  // 无回复提问的重试没有助手行映射可查，强制走权威可重试行
+  const allowLatestFallback = danglingUserRetry || c.req.query("last") === "1";
   const kind = args.mode === "edit" ? "userInput" : "assistantText";
   const mappedEntityId =
+    !danglingUserRetry &&
     typeof platformMessage.extra?.zcode_entity_id === "string" &&
     platformMessage.extra.zcode_entity_id
       ? platformMessage.extra.zcode_entity_id
@@ -358,11 +369,12 @@ export async function handleMessageCommand(
   }
 
   // runtime 已受理 rewind：平台消息表按同一边界截断（编辑从原提问起、
-  // 重试从原回复起），经串行链执行，先于命令轮收尾落库完成
+  // 重试从原回复起），经串行链执行，先于命令轮收尾落库完成。
+  // 无回复提问的重试保留提问行，只清其后内容
   const conversationId = tracked.conversationId;
   if (conversationId !== undefined) {
     void enqueueConversationWrite(conversationId, () =>
-      truncateFromMessage(conversationId, messageId, identity.userId),
+      truncateFromMessage(conversationId, messageId, identity.userId, danglingUserRetry),
     );
   }
   // 编辑轮的新提问即时落库（串行链保证排在截断之后）：与聊天流同一理由，
