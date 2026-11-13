@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 1,
+  "config": {
+    "providerOrder": [],
+    "providerConfigRules": {
+      "providerRules": [
+        {
+          "providerId": "e2e-local",
+          "providerName": "E2E Local",
+          "config": {
+            "group": "standard-personal",
+            "access": {
+              "type": "api-key",
+              "apiKey": "sk-e2e-local"
+            },
+            "api": {
+              "type": "openai-chat-completions",
+              "baseUrl": "http://127.0.0.1:9001"
+            },
+            "personalModelIds": [
+              "deepseek-v4-pro"
+            ]
+          }
+        }
+      ]
+    },
+    "modelConfigRules": {
+      "providerModelRules": [
+        {
+          "modelId": "deepseek-v4-pro",
+          "config": {
+            "enabled": true,
+            "properties": {
+              "requiresMfjsToolSchema": false,
+              "contextWindow": 200000,
+              "inputFormat": {
+                "supportsText": true,
+                "supportsImage": false,
+                "supportsVideo": false,
+                "supportsAudio": false,
+                "supportsPdf": false
+              },
+              "outputFormat": {
+                "supportsText": true
+              },
+              "supportsToolCall": true,
+              "supportsJsonSchemaOutput": false,
+              "supportsNativeWebSearch": false,
+              "supportsMidConversationSystem": false
+            },
+            "optionSpecs": {
+              "reasoningLevel": {
+                "values": [
+                  "disabled",
+                  "low",
+                  "high",
+                  "max"
+                ],
+                "map": "{}"
+              },
+              "maxOutputTokens": {
+                "max": 32000,
+                "map": "{\"max_completion_tokens\":maxOutputTokens}"
+              }
+            }
+          },
+          "providerId": "e2e-local"
+        }
+      ],
+      "manualProviderModelRules": []
+    }
+  }
+}
