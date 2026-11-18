@@ -207,7 +207,6 @@ export const SESSION_TOOL_DENYLIST: string[] = [
   "TaskStop",
   "TodoRead",
   "TodoWrite",
-  "AskUserQuestion",
   "ExitPlanMode",
   "EnterPlanMode",
   "ToolSearch",

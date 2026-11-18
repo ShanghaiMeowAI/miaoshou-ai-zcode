@@ -11,6 +11,7 @@ export interface BridgeConversation {
   threadId: string;
   /** ZCode 运行时标识：服务重启后按它冷恢复会话（新会话创建后回写） */
   zcodeSessionId?: string;
+  hasLegacyHistory?: boolean;
 }
 
 const CONVERSATION_LOOKUP_CACHE = new Map<number, BridgeConversation>();
@@ -106,7 +107,12 @@ async function internalGet(path: string): Promise<unknown | undefined> {
 
 function parseBridgeConversation(result: unknown): BridgeConversation | undefined {
   if (!result || typeof result !== "object") return undefined;
-  const record = result as { id?: unknown; thread_id?: unknown; zcode_session_id?: unknown };
+  const record = result as {
+    id?: unknown;
+    thread_id?: unknown;
+    zcode_session_id?: unknown;
+    has_legacy_history?: unknown;
+  };
   if (typeof record.id !== "number" || typeof record.thread_id !== "string") return undefined;
   return {
     id: record.id,
@@ -114,6 +120,7 @@ function parseBridgeConversation(result: unknown): BridgeConversation | undefine
     ...(typeof record.zcode_session_id === "string" && record.zcode_session_id
       ? { zcodeSessionId: record.zcode_session_id }
       : {}),
+    ...(record.has_legacy_history === true ? { hasLegacyHistory: true } : {}),
   };
 }
 

@@ -130,27 +130,27 @@ async function truncateFromMessage(
   messageId: number,
   userId: string,
   keepTarget = false,
-): Promise<void> {
+): Promise<{ ok: boolean; error?: string }> {
   const secret = internalSecret();
-  if (!secret) return;
-  try {
-    const response = await fetch(
-      `${internalBaseUrl()}/internal/bridge/messages/${messageId}/trailing?user_id=${encodeURIComponent(userId)}${keepTarget ? "&keep_target=1" : ""}`,
-      {
+  if (!secret) return { ok: true };
+  const url = `${internalBaseUrl()}/internal/bridge/messages/${messageId}/trailing?user_id=${encodeURIComponent(userId)}${keepTarget ? "&keep_target=1" : ""}`;
+  let lastError = "unknown";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const response = await fetch(url, {
         method: "DELETE",
         signal: AbortSignal.timeout(5000),
         headers: { "X-Internal-Secret": secret },
-      },
-    );
-    if (!response.ok) {
-      console.error(`[miaoshou-bridge] 消息截断失败 HTTP ${response.status}（消息 ${messageId}）`);
+      });
+      if (response.ok) return { ok: true };
+      lastError = `HTTP ${response.status}`;
+      console.error(`[miaoshou-bridge] 消息截断失败 ${lastError}（消息 ${messageId}）`);
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      console.error(`[miaoshou-bridge] 消息截断请求异常（消息 ${messageId}）`, lastError);
     }
-  } catch (error) {
-    console.error(
-      `[miaoshou-bridge] 消息截断请求异常（消息 ${messageId}）`,
-      error instanceof Error ? error.message : String(error),
-    );
   }
+  return { ok: false, error: lastError };
 }
 
 interface RowTarget {
@@ -302,7 +302,10 @@ export async function handleMessageCommand(
     });
   }
   if (!tracked) {
-    return c.json({ detail: "该会话的历史轮次无法恢复（运行时未保留），请直接发送新消息" }, 409);
+    const legacyNotice = !threadIdentity.zcode_session_id
+      ? "当前对话为旧版系统历史记录，历史轮次无法恢复，不支持原地重试或编辑，请新建对话继续"
+      : "该会话的历史轮次无法恢复（运行时未保留），请直接发送新消息";
+    return c.json({ detail: legacyNotice }, 409);
   }
   // 前端确认目标是最后一条时带 last=1：运行时的动作许可只发给最新一轮，
   // 这条标记允许在文本失步时直接采用运行时的权威可操作行。
@@ -335,6 +338,21 @@ export async function handleMessageCommand(
     return c.json({ detail: resolved }, 409);
   }
 
+  const bufferedEvents: Array<{ type?: string } & Record<string, unknown>> = [];
+  let streamEventHandler: ((serviceEvent: { type?: string } & Record<string, unknown>) => void) | undefined;
+  const subscribe = deps.rawAgentService.onDynamicSessionEvent({
+    workspacePath: deps.workspacePath,
+    sessionId: tracked.sessionId,
+    deliveryKind: "web-remote-replayable",
+  });
+  const unsubscribe = subscribe((serviceEvent) => {
+    if (streamEventHandler) {
+      streamEventHandler(serviceEvent);
+    } else {
+      bufferedEvents.push(serviceEvent);
+    }
+  });
+
   const commandType = args.mode === "edit" ? "editUserQuery" : "retryTurn";
   const payload =
     args.mode === "edit"
@@ -361,6 +379,9 @@ export async function handleMessageCommand(
     });
   const ackResult = isCommandAckOk(ack);
   if (!ackResult.ok) {
+    try {
+      unsubscribe.dispose?.();
+    } catch {}
     // 被拒时把目标行与错误码一并落日志：区分"选错行"与"运行时不允许该行操作"
     console.warn(
       `[miaoshou-bridge] 命令被拒 ${commandType} target=${JSON.stringify(resolved.target)} error=${ackResult.error ?? "unknown"}`,
@@ -372,11 +393,12 @@ export async function handleMessageCommand(
   // 重试从原回复起），经串行链执行，先于命令轮收尾落库完成。
   // 无回复提问的重试保留提问行，只清其后内容
   const conversationId = tracked.conversationId;
-  if (conversationId !== undefined) {
-    void enqueueConversationWrite(conversationId, () =>
-      truncateFromMessage(conversationId, messageId, identity.userId, danglingUserRetry),
-    );
-  }
+  const truncationPromise =
+    conversationId !== undefined
+      ? enqueueConversationWrite(conversationId, () =>
+          truncateFromMessage(conversationId, messageId, identity.userId, danglingUserRetry),
+        )
+      : undefined;
   // 编辑轮的新提问即时落库（串行链保证排在截断之后）：与聊天流同一理由，
   // 输出进行中刷新可见提问；成败记入收尾，早写失败时收尾补写
   const userMessagePersisted =
@@ -485,12 +507,7 @@ export async function handleMessageCommand(
         finishSignal.resolve();
       };
 
-      const subscribe = deps.rawAgentService.onDynamicSessionEvent({
-        workspacePath: deps.workspacePath,
-        sessionId: tracked.sessionId,
-        deliveryKind: "web-remote-replayable",
-      });
-      const unsubscribe = subscribe((serviceEvent) => {
+      const processServiceEvent = (serviceEvent: { type?: string } & Record<string, unknown>) => {
         try {
           if (serviceEvent.type === "session.event") {
             const probe = serviceEvent.event as { eventId?: unknown; type?: unknown } | undefined;
@@ -517,7 +534,7 @@ export async function handleMessageCommand(
               },
               // 命令轮的审批挂起同样终态化本流：前端以 interrupt 事件弹出
               // 卡片，用户的选择随后经既有 resume 路径回传
-              suspendStream: (permission: PendingPermission) => {
+              suspendStream: (permission: PendingPermission, interruptPayload: unknown) => {
                 if (pendingPermissions.has(permission.requestId)) return;
                 pendingPermissions.set(permission.requestId, permission);
                 const expiryTimer = setTimeout(() => {
@@ -533,7 +550,35 @@ export async function handleMessageCommand(
                   }
                 }, 10 * 60_000);
                 expiryTimer.unref?.();
-                finishTurn();
+                const payload = interruptPayload as {
+                  question: string;
+                  options: Array<{ label: string; value: string; description?: string }>;
+                  allow_custom?: boolean;
+                  questions?: Array<{
+                    question: string;
+                    header?: string;
+                    options: Array<{ label: string; value: string; description?: string }>;
+                    allow_custom: boolean;
+                  }>;
+                };
+                recordedBlocks.push({
+                  type: "interrupt",
+                  interruptId: permission.requestId,
+                  question: payload.question,
+                  options: payload.options,
+                  allowCustom: Boolean(payload.allow_custom ?? false),
+                  ...(payload.questions?.length
+                    ? { questions: payload.questions }
+                    : {}),
+                });
+                writeEvent(interruptPayload, false);
+                finalDoneEvent = {
+                  type: "done",
+                  run_id: runId,
+                  interrupted: true,
+                };
+                settled = true;
+                finishSignal.resolve();
               },
               onAutoApproveError: (toolName: string, error?: string) => {
                 writeEvent(
@@ -598,10 +643,25 @@ export async function handleMessageCommand(
         } catch {
           // 单条事件处理失败不中断整个流
         }
-      });
+      };
+      streamEventHandler = processServiceEvent;
+      for (const buffered of bufferedEvents.splice(0, bufferedEvents.length)) {
+        processServiceEvent(buffered);
+      }
 
       await finished;
       if (conversationId !== undefined) {
+        if (truncationPromise) {
+          const truncationResult = await truncationPromise;
+          if (!truncationResult.ok) {
+            writeFinalEvent({
+              type: "error",
+              message: `旧消息清理失败（${truncationResult.error ?? "未知原因"}），刷新后请检查历史记录`,
+              error: truncationResult.error ?? "truncate_failed",
+              run_id: runId,
+            });
+          }
+        }
         const zcodeEntityId = await latestAssistantEntityId(
           deps.rawAgentService,
           deps.workspacePath,

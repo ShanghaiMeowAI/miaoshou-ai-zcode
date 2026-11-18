@@ -73,6 +73,7 @@ export function primeQuantToolTitles(userId: string): void {
 
 /** 同步读取标题；未命中时用最近身份触发一次去重刷新（覆盖滚动升级窗口）。 */
 export function getQuantToolTitle(toolName: string): string | undefined {
+  if (toolName === "AskUserQuestion") return "向用户确认";
   const title = titleCache?.get(toolName);
   if (title === undefined && lastSeenUserId) startLoad(lastSeenUserId);
   return title;

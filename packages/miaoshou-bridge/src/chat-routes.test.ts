@@ -214,4 +214,92 @@ describe("registerMiaoshouChatRoutes 注册守卫", () => {
       },
     );
   });
+
+  it("同会话并发发送两条消息时按队列串行执行，不打断前一条", async () => {
+    await withEnv({ ZCODE_SERVER_AUTH_TOKEN: "t", QUANT_MCP_INTERNAL_SECRET: "s" }, async () => {
+      const { conversationSessionMap } = await import("./chat-shared.js");
+      const { resetConversationTurnGatesForTests } = await import("./chat-session-gate.js");
+      conversationSessionMap.clear();
+      resetConversationTurnGatesForTests();
+      conversationSessionMap.set("42:t88", {
+        userId: "42",
+        sessionId: "sess_seq",
+        lastUsedAt: Date.now(),
+        conversationId: 88,
+      });
+      vi.stubGlobal("fetch", async (input: unknown) => {
+        const url = String(input);
+        if (url.includes("/conversations/88")) {
+          return { ok: true, json: async () => ({ id: 88, thread_id: "t88" }) } as Response;
+        }
+        return { ok: true, json: async () => ({}) } as Response;
+      });
+      const events: string[] = [];
+      let activeListeners: Array<(ev: unknown) => void> = [];
+      const services = {
+        get: () => ({
+          onDynamicSessionEvent: () => (cb: (event: unknown) => void) => {
+            activeListeners.push(cb);
+            return {
+              dispose: () => {
+                activeListeners = activeListeners.filter((item) => item !== cb);
+              },
+            };
+          },
+          sendConversationCommandV4: async () => ({ status: "accepted" }),
+          closeSession: async () => true,
+          createSession: async () => ({ session: { sessionId: "sess_seq" } }),
+          sendPrompt: async ({ content }: { content: string }) => {
+            events.push(`start:${content}`);
+            const currentListeners = [...activeListeners];
+            setTimeout(() => {
+              events.push(`end:${content}`);
+              for (const cb of currentListeners) {
+                cb({
+                  type: "session.event",
+                  event: {
+                    type: "turn.completed",
+                    eventId: `evt-${content}`,
+                    payload: { resultType: "success", response: `ok:${content}` },
+                  },
+                });
+              }
+            }, 30);
+            return { ok: true };
+          },
+        }),
+        getOptional: () => undefined,
+      } as unknown as Parameters<typeof registerMiaoshouChatRoutes>[1];
+
+      try {
+        const app = new Hono();
+        registerMiaoshouChatRoutes(app, services);
+        const sendAndRead = async (message: string) => {
+          const res = await app.request("/api/agent/chat", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-platform-token": "t",
+              "x-user-id": "42",
+              "x-user-role": "user",
+            },
+            body: JSON.stringify({ message, conversation_id: 88 }),
+          });
+          expect(res.status).toBe(200);
+          return res.text();
+        };
+        await Promise.all([sendAndRead("第一条"), sendAndRead("第二条")]);
+        expect(events).toEqual([
+          "start:第一条",
+          "end:第一条",
+          "start:第二条",
+          "end:第二条",
+        ]);
+      } finally {
+        conversationSessionMap.clear();
+        resetConversationTurnGatesForTests();
+        vi.unstubAllGlobals();
+      }
+    });
+  });
 });

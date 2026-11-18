@@ -7,8 +7,13 @@ import {
   extractMiaoshouIdentity,
   registerSessionOwner,
   rememberUserToken,
-  getUserToken,
 } from "./index.js";
+import {
+  acquireConversationTurnSlot,
+  emitDeniedResumeToolResult,
+  registerUserTokenRoute,
+  streamLegacyConversationNotice,
+} from "./chat-session-gate.js";
 
 import {
   DEFAULT_WORKSPACE_PATH,
@@ -29,10 +34,9 @@ import {
   runExecutionRegistry,
   runRegistry,
   runCancelHandlers,
-  structuredFailureContent,
   type PendingPermission,
 } from "./chat-shared.js";
-import { getQuantToolTitle, primeQuantToolTitles } from "./quant-tool-titles.js";
+import { primeQuantToolTitles } from "./quant-tool-titles.js";
 import { startSessionIdleSweep } from "./chat-idle-sweep.js";
 import { createRowServiceCache, resolveTurnEntityId } from "./chat-row-query.js";
 import { attachTurnHub } from "./chat-turn-hub.js";
@@ -120,8 +124,9 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
   const resolvePermission = (
     permission: PendingPermission,
     wantAllow: boolean,
+    answers?: Record<string, string>,
   ): Promise<{ ok: boolean; error?: string }> =>
-    resolvePermissionWith({ workspacePath, rawAgentService }, permission, wantAllow);
+    resolvePermissionWith({ workspacePath, rawAgentService }, permission, wantAllow, answers);
 
   // ── 核心流式对话接口：POST /api/agent/chat ─────────────────────────────
   // 兼顾带 /agent 网关前缀（前端实际请求基地址）与不带前缀两种路径
@@ -193,6 +198,13 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
         ? String(conversation_id)
         : String(Date.now());
     const convKey = `${identity.userId}:${clientConvId}`;
+    let releaseTurnGate: (() => void) | undefined;
+    try {
+      releaseTurnGate = await acquireConversationTurnSlot(convKey, c.req.raw.signal);
+    } catch {
+      releaseStreamSlot();
+      return c.json({ detail: "请求已取消" }, 499);
+    }
     let tracked = conversationSessionMap.get(convKey);
 
     // 服务重启后内存映射丢失：平台会话表持久化了运行时标识时，冷恢复原会话，
@@ -207,11 +219,27 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
       });
     }
 
+    if (!tracked && bridgeConversation?.hasLegacyHistory && !isResume) {
+      releaseTurnGate();
+      releaseStreamSlot();
+      return streamLegacyConversationNotice(
+        c,
+        bridgeConversation.id,
+        bridgeConversation.threadId,
+        runId,
+      );
+    }
+
     // 兼容旧前端的中断恢复契约：审批选项以 resume 字段随下一条消息回传。
     // 解析逻辑拆在 approval-routes（parsePendingResume）；回执动作延迟到
     // 观察流订阅建立之后执行，避免"回执后、订阅前"的事件间隙丢失终态。
     let pendingResolution:
-      | { requestId: string; permission: PendingPermission; wantAllow: boolean }
+      | {
+          requestId: string;
+          permission: PendingPermission;
+          wantAllow: boolean;
+          answers?: Record<string, string>;
+        }
       | undefined;
     if (isResume) {
       const resolution = parsePendingResume(
@@ -226,6 +254,7 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
           // 用户输入了新文本，平滑降级为普通对话轮次，不以 409 阻断
           isResume = false;
         } else {
+          releaseTurnGate();
           releaseStreamSlot();
           return c.json({ detail: "当前没有待处理的审批" }, 409);
         }
@@ -235,6 +264,7 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
         // 自动拒绝挂起审批（带待回放终态），文本降级为新指令继续对话，
         // 不再 400 静默吞掉输入（用户会误以为卡死）。文本为空时仍显式拒绝。
         if (!message.trim()) {
+          releaseTurnGate();
           releaseStreamSlot();
           return c.json(
             {
@@ -286,6 +316,7 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
           period === "weekly"
             ? "本周 AI 额度已用完，下周重置后再试"
             : "今日 AI 额度已用完，明日重置后再试";
+        releaseTurnGate();
         releaseStreamSlot();
         return c.json(
           {
@@ -375,6 +406,7 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
         );
       }
     } catch (error) {
+      releaseTurnGate();
       releaseStreamSlot();
       return c.json({ detail: error instanceof Error ? error.message : "会话准备失败" }, 500);
     }
@@ -521,14 +553,22 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
           // 消息回传——因此 interrupt 之后必须给本流发终态，前端才能交互。
           const payload = interruptPayload as {
             question: string;
-            options: Array<{ label: string; value: string }>;
+            options: Array<{ label: string; value: string; description?: string }>;
+            allow_custom?: boolean;
+            questions?: Array<{
+              question: string;
+              header?: string;
+              options: Array<{ label: string; value: string; description?: string }>;
+              allow_custom: boolean;
+            }>;
           };
           recordedBlocks.push({
             type: "interrupt",
             interruptId: permission.requestId,
             question: payload.question,
             options: payload.options,
-            allowCustom: false,
+            allowCustom: Boolean(payload.allow_custom ?? false),
+            ...(payload.questions?.length ? { questions: payload.questions } : {}),
           });
           writeEvent(interruptPayload, false);
           // done 同样延后到回写落库之后：interrupt 卡片已记入 blocks，
@@ -758,6 +798,7 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
           const resolveResult = await resolvePermission(
             pendingResolution.permission,
             pendingResolution.wantAllow,
+            pendingResolution.answers,
           );
           if (!resolveResult.ok) {
             writeEvent(
@@ -775,35 +816,12 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
           } else {
             pendingPermissions.delete(pendingResolution.requestId);
             if (!pendingResolution.wantAllow) {
-              // CLI 在权限被拒后不再投递 ToolCallResult：这里补 tool_result
-              // 终态，否则前端那张"执行中"卡片永远不收口；同时记入 blocks
-              // 保证刷新后回显不丢
-              const deniedToolCallId = pendingResolution.permission.toolCallId;
-              if (deniedToolCallId) {
-                emittedToolCalls.add(deniedToolCallId);
-                const deniedToolName = pendingResolution.permission.toolName;
-                const cancelContent = structuredFailureContent(
-                  "blocked",
-                  "用户取消了该操作，未执行。",
-                );
-                const deniedTitle = getQuantToolTitle(deniedToolName);
-                recordedBlocks.push({
-                  type: "tool_call",
-                  id: deniedToolCallId,
-                  name: deniedToolName,
-                  ...(deniedTitle ? { title: deniedTitle } : {}),
-                  result: cancelContent,
-                });
-                writeEvent(
-                  {
-                    type: "tool_result",
-                    id: deniedToolCallId,
-                    ok: false,
-                    content: cancelContent,
-                  },
-                  false,
-                );
-              }
+              emitDeniedResumeToolResult({
+                permission: pendingResolution.permission,
+                emittedToolCalls,
+                recordedBlocks,
+                writeEvent,
+              });
             }
           }
         }
@@ -925,6 +943,7 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
           } catch {}
         }
         liveStreamSessions.delete(sessionId);
+        releaseTurnGate();
         releaseStreamSlot();
       }
     });
@@ -943,32 +962,5 @@ export function registerMiaoshouChatRoutes(app: Hono, services: ServiceCollectio
   });
 
   registerApprovalRoutes(app, { workspacePath, rawAgentService });
-
-  // ── 内部凭据换发端点：供本地回环的 quant MCP 动态拉取用户最新 token ──
-  app.get("/internal/bridge/user-token", (c) => {
-    const internalSecret =
-      process.env.QUANT_MCP_INTERNAL_SECRET || process.env.MIAOSHOU_QUANT_INTERNAL_SECRET;
-    const suppliedSecret =
-      c.req.header("x-internal-secret") ||
-      c.req.header("x-platform-token") ||
-      "";
-    if (internalSecret && suppliedSecret !== internalSecret) {
-      return c.json({ ok: false, detail: "unauthorized" }, 401);
-    }
-    const rawUserId = c.req.query("user_id");
-    const userId = Number(rawUserId);
-    if (!Number.isInteger(userId) || userId <= 0) {
-      return c.json({ ok: false, detail: "invalid_user_id" }, 400);
-    }
-    const cached = getUserToken(userId);
-    if (!cached) {
-      return c.json({ ok: false, detail: "token_not_found" }, 404);
-    }
-    return c.json({
-      ok: true,
-      user_id: userId,
-      authorization: cached.token,
-      updated_at: cached.updatedAt,
-    });
-  });
+  registerUserTokenRoute(app);
 }

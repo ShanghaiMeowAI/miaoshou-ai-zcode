@@ -33,12 +33,17 @@ export const QUANT_ALLOWED_TOOLS = new Set([
   "strategy_get_detail",
   "strategy_compose_and_verify",
   "strategy_save",
+  "strategy_fork",
   "catalog_search_indicators",
   "catalog_get_industries",
   "formula_compose_and_check",
   "backtest_run",
   "backtest_get_analysis",
   "market_get_latest_trade_date",
+  "factor_list_scopes",
+  "factor_query_rankings",
+  "factor_get_summary",
+  "factor_compare",
 ]);
 
 export interface TrackedConversation {
@@ -51,6 +56,13 @@ export interface TrackedConversation {
   modelId?: string;
 }
 
+export interface AskUserQuestionItem {
+  question: string;
+  header?: string;
+  options: Array<{ label: string; description?: string }>;
+  multiSelect?: boolean;
+}
+
 export interface PendingPermission {
   userId: string;
   sessionId: string;
@@ -59,6 +71,10 @@ export interface PendingPermission {
   createdAt: number;
   /** 量化工具的规范化名称：拒绝终态卡片与审批提示文案都用它 */
   toolName: string;
+  /** 区分普通工具审批与 AskUserQuestion 用户提问 */
+  kind?: "permission" | "ask_user_question";
+  /** AskUserQuestion 问题明细（用于构建 interrupt 卡片与回填答案） */
+  questions?: AskUserQuestionItem[];
   /** 挂起时所在轮次的 run 键与前台执行 id，回执后的取消/stop 用它防误停 */
   runId: string;
   executionId?: string;

@@ -18,6 +18,7 @@ import {
   runRegistry,
   selectPermissionOption,
   structuredFailureContent,
+  type AskUserQuestionItem,
   type PendingPermission,
 } from "./chat-shared.js";
 import { extractMiaoshouIdentity, rememberUserToken } from "./index.js";
@@ -35,10 +36,29 @@ export async function resolvePermissionWith(
   deps: ApprovalDeps,
   permission: PendingPermission,
   wantAllow: boolean,
+  answers?: Record<string, string>,
 ): Promise<{ ok: boolean; error?: string }> {
-  const optionId = selectPermissionOption(permission.options, wantAllow)?.optionId;
-  if (wantAllow && !optionId) {
-    return { ok: false, error: "permission options carry no allow choice" };
+  let answerPayload: Record<string, unknown>;
+  if (permission.kind === "ask_user_question") {
+    // 按题收集非空答案（键 = 问题文本）；一题都没答视为用户放弃回答，
+    // 按 decline 收口让模型用最佳判断继续，不悬挂
+    const provided = answers ?? {};
+    const collected: Record<string, string> = {};
+    for (const item of permission.questions ?? []) {
+      const value = String(provided[item.question] ?? "").trim();
+      if (value) collected[item.question] = value;
+    }
+    if (!wantAllow || Object.keys(collected).length === 0) {
+      answerPayload = { action: "decline" };
+    } else {
+      answerPayload = { action: "accept", content: { answers: collected } };
+    }
+  } else {
+    const optionId = selectPermissionOption(permission.options, wantAllow)?.optionId;
+    if (wantAllow && !optionId) {
+      return { ok: false, error: "permission options carry no allow choice" };
+    }
+    answerPayload = optionId ? { optionId } : {};
   }
   try {
     const ack = await deps.rawAgentService.sendConversationCommandV4({
@@ -47,7 +67,7 @@ export async function resolvePermissionWith(
         "resolveInteraction",
         {
           interactionId: permission.requestId,
-          answer: optionId ? { optionId } : {},
+          answer: answerPayload,
         },
         permission.sessionId,
       ),
@@ -83,6 +103,41 @@ export function sweepExpiredPendingWith(deps: ApprovalDeps): void {
  */
 export type PermissionDisposition = "auto_approve" | "pending" | "reject";
 
+function parseAskUserQuestions(input: unknown): AskUserQuestionItem[] {
+  if (!input || typeof input !== "object") return [];
+  const rawQuestions = (input as { questions?: unknown }).questions;
+  if (!Array.isArray(rawQuestions)) return [];
+  const items: AskUserQuestionItem[] = [];
+  for (const raw of rawQuestions) {
+    if (!raw || typeof raw !== "object") continue;
+    const record = raw as Record<string, unknown>;
+    const question = String(record.question ?? "").trim();
+    if (!question) continue;
+    const rawOptions = Array.isArray(record.options) ? record.options : [];
+    const options: Array<{ label: string; description?: string }> = [];
+    for (const opt of rawOptions) {
+      if (!opt || typeof opt !== "object") continue;
+      const optRec = opt as Record<string, unknown>;
+      const label = String(optRec.label ?? "").trim();
+      if (!label) continue;
+      const description =
+        typeof optRec.description === "string" && optRec.description.trim()
+          ? optRec.description.trim()
+          : undefined;
+      options.push({ label, ...(description ? { description } : {}) });
+    }
+    items.push({
+      question,
+      ...(typeof record.header === "string" && record.header.trim()
+        ? { header: record.header.trim() }
+        : {}),
+      options,
+      multiSelect: Boolean(record.multiSelect),
+    });
+  }
+  return items;
+}
+
 export function buildPendingPermission(params: {
   userId: string;
   sessionId: string;
@@ -93,6 +148,7 @@ export function buildPendingPermission(params: {
     requestId: string;
     toolName: string;
     toolCallId?: string;
+    input?: unknown;
     options?: Array<{ optionId: string; kind: string; name: string }>;
   };
 }): {
@@ -101,6 +157,8 @@ export function buildPendingPermission(params: {
   toolName: string;
 } {
   const toolName = normalizeQuantToolName(String(params.request.toolName || ""));
+  const isAskUserQuestion = toolName === "AskUserQuestion";
+  const questions = isAskUserQuestion ? parseAskUserQuestions(params.request.input) : undefined;
   const permission: PendingPermission = {
     userId: params.userId,
     sessionId: params.sessionId,
@@ -108,6 +166,7 @@ export function buildPendingPermission(params: {
     requestId: params.request.requestId,
     createdAt: Date.now(),
     toolName,
+    ...(isAskUserQuestion ? { kind: "ask_user_question" as const, questions } : {}),
     runId: params.runId,
     executionId: params.executionId,
     options: params.request.options,
@@ -115,22 +174,63 @@ export function buildPendingPermission(params: {
   if (typeof params.request.toolCallId === "string" && params.request.toolCallId) {
     permission.toolCallId = params.request.toolCallId;
   }
-  const disposition: PermissionDisposition = QUANT_ALLOWED_TOOLS.has(toolName)
-    ? "auto_approve"
-    : "reject";
+  const disposition: PermissionDisposition = isAskUserQuestion
+    ? "pending"
+    : QUANT_ALLOWED_TOOLS.has(toolName)
+      ? "auto_approve"
+      : "reject";
   return { permission, disposition, toolName };
 }
-/** 挂起审批下发给前端的 interrupt 事件载荷（旧前端契约：固定双选项、不可自定义）。 */
+/** 挂起交互下发给前端的 interrupt 事件载荷。
+ *  AskUserQuestion 附带结构化 questions（每题独立选项与自定义输入）；
+ *  旧的单题 question/options 字段保留兼容在途旧前端。 */
 export function buildInterruptPayload(
   toolName: string,
   requestId: string,
+  permission?: PendingPermission,
 ): {
   type: "interrupt";
   interrupt_id: string;
   question: string;
-  options: Array<{ label: string; value: string }>;
+  options: Array<{ label: string; value: string; description?: string }>;
   allow_custom: boolean;
+  questions?: Array<{
+    question: string;
+    header?: string;
+    options: Array<{ label: string; value: string; description?: string }>;
+    allow_custom: boolean;
+  }>;
 } {
+  if (permission?.kind === "ask_user_question") {
+    const questions = permission.questions ?? [];
+    const primary = questions[0];
+    const structured = questions.map((item) => ({
+      question: item.question,
+      ...(item.header ? { header: item.header } : {}),
+      options: (item.options ?? []).map((opt) => ({
+        label: opt.label,
+        value: opt.label,
+        ...(opt.description ? { description: opt.description } : {}),
+      })),
+      allow_custom: true,
+    }));
+    const questionText =
+      questions.length > 1
+        ? questions.map((item, idx) => `${idx + 1}. ${item.question}`).join("\n")
+        : (primary?.question || "请补充您的具体要求");
+    return {
+      type: "interrupt",
+      interrupt_id: requestId,
+      question: questionText,
+      options: (primary?.options ?? []).map((opt) => ({
+        label: opt.label,
+        value: opt.label,
+        ...(opt.description ? { description: opt.description } : {}),
+      })),
+      allow_custom: true,
+      ...(structured.length ? { questions: structured } : {}),
+    };
+  }
   return {
     type: "interrupt",
     interrupt_id: requestId,
@@ -164,7 +264,18 @@ export type ResumeResolution =
       requestId: string;
       permission: PendingPermission;
       wantAllow: boolean;
+      answers?: Record<string, string>;
     };
+
+function collectAnswerMap(raw: unknown): Record<string, string> {
+  const answers: Record<string, string> = {};
+  if (!raw || typeof raw !== "object") return answers;
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    const text = String(value ?? "").trim();
+    if (text) answers[key] = text;
+  }
+  return answers;
+}
 
 export function parsePendingResume(
   userId: string,
@@ -181,6 +292,30 @@ export function parsePendingResume(
     : undefined;
   if (!trackedSessionId || !pendingEntry) return { kind: "none" };
   const [requestId, permission] = pendingEntry;
+  if (permission.kind === "ask_user_question") {
+    const rawPayload = (resumePayload ?? {}) as {
+      answers?: unknown;
+      label?: unknown;
+      value?: unknown;
+    };
+    const answerMap = collectAnswerMap(rawPayload.answers);
+    if (Object.keys(answerMap).length === 0) {
+      // 旧前端单字段回退：label/value 作为第一题（单题场景）的答案
+      const text = String(rawPayload.label ?? rawPayload.value ?? "").trim();
+      if (!text) {
+        return { kind: "invalid_value", requestId, permission };
+      }
+      const firstQuestion = permission.questions?.[0]?.question;
+      if (firstQuestion) answerMap[firstQuestion] = text;
+    }
+    return {
+      kind: "resolved",
+      requestId,
+      permission,
+      wantAllow: true,
+      answers: answerMap,
+    };
+  }
   const resumeValue = String((resumePayload as { value?: unknown }).value ?? "")
     .trim()
     .toLowerCase();
@@ -250,6 +385,7 @@ export function handlePermissionRequestedEvent(params: {
     requestId: String(rawReq.requestId || rawReq.id || `req_${Date.now()}`),
     toolName: String(rawReq.toolName || rawReq.name || ""),
     toolCallId: rawReq.toolCallId ? String(rawReq.toolCallId) : undefined,
+    input: rawReq.input ?? rawReq.args,
     options: rawReq.options,
   };
   // 判定与构造拆在本模块（buildPendingPermission）
@@ -299,13 +435,19 @@ export function handlePermissionRequestedEvent(params: {
     void params.resolve(permission, false).catch(() => {});
     return true;
   }
-  params.hooks.suspendStream(permission, buildInterruptPayload(toolName, request.requestId));
+  params.hooks.suspendStream(
+    permission,
+    buildInterruptPayload(toolName, request.requestId, permission),
+  );
   return true;
 }
 
 export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
-  const resolvePermission = (permission: PendingPermission, wantAllow: boolean) =>
-    resolvePermissionWith(deps, permission, wantAllow);
+  const resolvePermission = (
+    permission: PendingPermission,
+    wantAllow: boolean,
+    answers?: Record<string, string>,
+  ) => resolvePermissionWith(deps, permission, wantAllow, answers);
   const sweepExpiredPending = () => sweepExpiredPendingWith(deps);
 
   // ── 审批回执：POST /api/agent/interrupts/:interruptId ──────────────────
@@ -329,16 +471,32 @@ export function registerApprovalRoutes(app: Hono, deps: ApprovalDeps): void {
       return c.json({ detail: "审批已过期，操作已被自动拒绝" }, 410);
     }
     const body = await c.req.json().catch(() => null);
-    const rawValue = String(body?.value ?? "")
-      .trim()
-      .toLowerCase();
-    // 与 resume 分支同一白名单口径：非法值显式拒绝，
-    // 不静默按 deny 处理（用户点错接口不该被当成主动取消）
-    if (rawValue !== "allow" && rawValue !== "deny") {
-      return c.json({ detail: "value 只接受 allow 或 deny" }, 400);
+    let wantAllow: boolean;
+    let answers: Record<string, string> | undefined;
+    if (permission.kind === "ask_user_question") {
+      const answerMap = collectAnswerMap(body?.answers);
+      if (Object.keys(answerMap).length === 0) {
+        const text = String(body?.label ?? body?.value ?? "").trim();
+        if (!text) {
+          return c.json({ detail: "请提供回答内容" }, 400);
+        }
+        const firstQuestion = permission.questions?.[0]?.question;
+        if (firstQuestion) answerMap[firstQuestion] = text;
+      }
+      wantAllow = true;
+      answers = answerMap;
+    } else {
+      const rawValue = String(body?.value ?? "")
+        .trim()
+        .toLowerCase();
+      // 与 resume 分支同一白名单口径：非法值显式拒绝，
+      // 不静默按 deny 处理（用户点错接口不该被当成主动取消）
+      if (rawValue !== "allow" && rawValue !== "deny") {
+        return c.json({ detail: "value 只接受 allow 或 deny" }, 400);
+      }
+      wantAllow = rawValue === "allow";
     }
-    const wantAllow = rawValue === "allow";
-    const result = await resolvePermission(permission, wantAllow);
+    const result = await resolvePermission(permission, wantAllow, answers);
     if (!result.ok) return c.json({ detail: result.error ?? "审批提交失败" }, 500);
     pendingPermissions.delete(permission.requestId);
     if (!wantAllow) {

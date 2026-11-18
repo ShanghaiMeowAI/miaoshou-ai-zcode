@@ -585,6 +585,139 @@ describe("registerMiaoshouChatRoutes 审批与回放", () => {
     });
   });
 
+  it("AskUserQuestion 挂起为按题作答的提问卡片并把 answers 映射回填至 resolveInteraction", async () => {
+    await withEnv({ ZCODE_SERVER_AUTH_TOKEN: "t", QUANT_MCP_INTERNAL_SECRET: "s" }, async () => {
+      const { pendingPermissions, conversationSessionMap } = await import("./chat-shared.js");
+      pendingPermissions.clear();
+      conversationSessionMap.clear();
+      conversationSessionMap.set("42:conv-ask", {
+        userId: "42",
+        sessionId: "sess_ask",
+        lastUsedAt: Date.now(),
+      });
+      vi.stubGlobal("fetch", stubBridgeFetch([]));
+      const resolvedEnvelopes: Array<unknown> = [];
+      let turnPhase: "ask" | "answer" = "ask";
+      const askServices = {
+        get: () => ({
+          onDynamicSessionEvent:
+            () =>
+            (cb: (event: unknown) => void): { dispose: () => void } => {
+              queueMicrotask(() => {
+                if (turnPhase === "ask") {
+                  cb({
+                    type: "session.event",
+                    event: {
+                      type: "permission.requested",
+                      eventId: "evt-ask-1",
+                      payload: {
+                        requestId: "req-ask-1",
+                        toolName: "AskUserQuestion",
+                        toolCallId: "call-ask-1",
+                        input: {
+                          questions: [
+                            {
+                              question: "请问您希望使用哪个调仓周期？",
+                              header: "调仓周期",
+                              options: [
+                                { label: "按周调仓", description: "每周最后一个交易日调仓" },
+                                { label: "按月调仓", description: "每月最后一个交易日调仓" },
+                              ],
+                              multiSelect: false,
+                            },
+                            {
+                              question: "最大持仓股票数希望是多少只？",
+                              header: "持仓数量",
+                              options: [
+                                { label: "10 只" },
+                                { label: "30 只" },
+                              ],
+                              multiSelect: false,
+                            },
+                          ],
+                        },
+                      },
+                    },
+                  });
+                } else {
+                  cb({
+                    type: "session.event",
+                    event: {
+                      type: "turn.completed",
+                      eventId: "evt-ask-done",
+                      payload: { resultType: "success", response: "收到，按双周调仓配置。" },
+                    },
+                  });
+                }
+              });
+              return { dispose: () => {} };
+            },
+          sendConversationCommandV4: async ({ envelope }: { envelope: unknown }) => {
+            resolvedEnvelopes.push(envelope);
+            return { status: "accepted" };
+          },
+          closeSession: async () => true,
+          createSession: async () => ({ session: { sessionId: "sess_ask" } }),
+          sendPrompt: async () => ({ ok: true }),
+        }),
+        getOptional: () => undefined,
+      } as unknown as Parameters<typeof registerMiaoshouChatRoutes>[1];
+
+      const app = new Hono();
+      registerMiaoshouChatRoutes(app, askServices);
+
+      const firstRes = await app.request("/api/agent/chat", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-platform-token": "t",
+          "x-user-id": "42",
+          "x-user-role": "user",
+        },
+        body: JSON.stringify({ conversation_id: "conv-ask", message: "帮我建一个策略" }),
+      });
+      expect(firstRes.status).toBe(200);
+      const firstText = await firstRes.text();
+      expect(firstText).toContain('"type":"interrupt"');
+      expect(firstText).toContain('"allow_custom":true');
+      expect(firstText).toContain("请问您希望使用哪个调仓周期？");
+      expect(firstText).toContain("最大持仓股票数希望是多少只？");
+      expect(firstText).toContain('"questions":[');
+      expect(pendingPermissions.has("req-ask-1")).toBe(true);
+
+      turnPhase = "answer";
+      const secondRes = await app.request("/api/agent/chat", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-platform-token": "t",
+          "x-user-id": "42",
+          "x-user-role": "user",
+        },
+        body: JSON.stringify({
+          conversation_id: "conv-ask",
+          message: "每10个交易日调仓，持仓20只",
+          resume: {
+            answers: {
+              "请问您希望使用哪个调仓周期？": "每10个交易日调仓",
+              "最大持仓股票数希望是多少只？": "20 只",
+            },
+          },
+        }),
+      });
+      expect(secondRes.status).toBe(200);
+      await secondRes.text();
+      expect(pendingPermissions.has("req-ask-1")).toBe(false);
+      expect(resolvedEnvelopes).toHaveLength(1);
+      const answerText = JSON.stringify(resolvedEnvelopes[0]);
+      expect(answerText).toContain("每10个交易日调仓");
+      expect(answerText).toContain("20 只");
+      pendingPermissions.clear();
+      conversationSessionMap.clear();
+      vi.unstubAllGlobals();
+    });
+  });
+
   function stubBridgeFetch(calls: Array<{ url: string; body?: Record<string, unknown> }>) {
     return async (input: unknown, init?: { body?: string }) => {
       const url = String(input);
