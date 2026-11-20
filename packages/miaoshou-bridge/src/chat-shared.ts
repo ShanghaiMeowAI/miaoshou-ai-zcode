@@ -33,7 +33,6 @@ export const QUANT_ALLOWED_TOOLS = new Set([
   "strategy_get_detail",
   "strategy_compose_and_verify",
   "strategy_save",
-  "strategy_fork",
   "catalog_search_indicators",
   "catalog_get_industries",
   "formula_compose_and_check",
